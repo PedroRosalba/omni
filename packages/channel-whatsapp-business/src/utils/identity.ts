@@ -5,6 +5,17 @@
  * digits-only already. Outbound senders strip `+` and any non-digits.
  */
 
+import { computeWaid } from '@omni/core';
+
+/**
+ * Chat key for a phone: digits only, Brazilian ninth digit normalized the
+ * way WhatsApp ids are (#1279). Inbound `from` is already in this form, so an
+ * outbound chat keyed with it is the same chat the reply lands in.
+ */
+export function toWaId(input: string): string {
+  return computeWaid(toMetaPhone(input));
+}
+
 /**
  * Normalize an arbitrary phone string to Meta wire format (digits only).
  *
