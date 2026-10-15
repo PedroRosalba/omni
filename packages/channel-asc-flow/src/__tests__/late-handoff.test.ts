@@ -17,11 +17,13 @@ import { afterEach, describe, expect, it } from 'bun:test';
 import { AscFlowPlugin } from '../plugin';
 import {
   MockEventBus,
+  OK_BODY,
   type RecordedCall,
   TURN_TEXT,
   connectPlugin,
   createContext,
   instanceId,
+  jsonResponse,
   openTurn,
   stubPlatform,
 } from './helpers';
@@ -31,8 +33,8 @@ let eventBus: MockEventBus;
 let calls: RecordedCall[];
 let restore: () => void;
 
-async function boot(): Promise<void> {
-  const stub = stubPlatform();
+async function boot(overrides: Record<string, () => Response> = {}): Promise<void> {
+  const stub = stubPlatform(overrides);
   calls = stub.calls;
   restore = stub.restore;
   eventBus = new MockEventBus();
@@ -88,7 +90,13 @@ describe('a late handoff rides the turn now in flight', () => {
   });
 
   it('pushes the newer turn ordinary answer as a bubble instead of losing it', async () => {
-    await boot();
+    // B's own answer fails to reach the handset, so it only lives in the parked
+    // body; the late handoff takes that body over and must push it out.
+    let attempt = 0;
+    await boot({
+      '/callbackFlowMsg': () =>
+        ++attempt === 1 ? jsonResponse({ cod_error: 1, sucesso: 0 }, 500) : jsonResponse(OK_BODY),
+    });
     await openTurn(plugin, '42', 'Chamar especialista');
     const traceA = turns()?.get('42')?.correlationId;
     const a = turns()?.get('42');
@@ -104,7 +112,44 @@ describe('a late handoff rides the turn now in flight', () => {
     await send('Convidamos um especialista.', { ...HANDOFF, correlationId: traceA });
 
     expect(plugin.takeReadyTurn(instanceId, '42', 'Ok')?.hand_off).toBe('sim');
-    expect(calls.some((c) => c.path === '/callbackFlowMsg')).toBe(true);
+    expect(calls.some((c) => c.path === '/callbackFlowMsg' && c.body.msg_usuario === 'Seguimos por aqui.')).toBe(true);
+  });
+
+  it('does not push again an ordinary answer that already reached the handset', async () => {
+    await boot();
+    await openTurn(plugin, '42', 'Chamar especialista');
+    const traceA = turns()?.get('42')?.correlationId;
+    const a = turns()?.get('42');
+    if (a) a.at -= 200_000;
+    plugin.takeReadyTurn(instanceId, '42', 'Chamar especialista');
+
+    await openTurn(plugin, '42', 'Ok');
+    const b = turns()?.get('42');
+    if (b) b.correlationId = 'trace-B';
+    await send('Seguimos por aqui.', { correlationId: 'trace-B' });
+    calls.length = 0;
+
+    await send('Convidamos um especialista.', { ...HANDOFF, correlationId: traceA });
+
+    expect(calls.some((c) => c.body.msg_usuario === 'Seguimos por aqui.')).toBe(false);
+  });
+
+  it('keeps a newer parked handoff over an older late one', async () => {
+    await boot();
+    await openTurn(plugin, '42', 'Chamar especialista');
+    const traceA = turns()?.get('42')?.correlationId;
+    const a = turns()?.get('42');
+    if (a) a.at -= 200_000;
+    plugin.takeReadyTurn(instanceId, '42', 'Chamar especialista');
+
+    await openTurn(plugin, '42', 'quero falar com alguem');
+    const b = turns()?.get('42');
+    if (b) b.correlationId = 'trace-B';
+    await send('Convidamos (B).', { ...HANDOFF, handoffQueue: 'FILA_B', correlationId: 'trace-B' });
+
+    await send('Convidamos (A).', { ...HANDOFF, correlationId: traceA });
+
+    expect(plugin.takeReadyTurn(instanceId, '42', 'quero falar com alguem')?.fila_vq).toBe('FILA_B');
   });
 });
 
@@ -119,6 +164,21 @@ describe('a parked handoff is collected by the next poll, whatever its text', ()
       hand_off: 'sim',
     });
     expect(turns()?.has('42')).toBe(false);
+  });
+
+  it('remembers the text it answered, so a re-send of it reads as a replay', async () => {
+    await boot();
+    await openTurn(plugin);
+    await send('Convidamos um especialista.', HANDOFF);
+
+    plugin.takeReadyTurn(instanceId, '42', 'alguem vai me atender?');
+
+    const answered = (
+      plugin as unknown as {
+        ascFlowInstances: Map<string, { lastAnswered: Map<string, string> }>;
+      }
+    ).ascFlowInstances.get(instanceId)?.lastAnswered;
+    expect(answered?.get('42')).toBe('alguem vai me atender?');
   });
 
   it('still never spends an ORDINARY parked answer on a different message', async () => {

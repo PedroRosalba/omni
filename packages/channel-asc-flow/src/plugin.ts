@@ -878,7 +878,13 @@ export class AscFlowPlugin extends BaseChannelPlugin {
     ready: AscFlowTurnReady,
     reason: string,
   ): void {
-    if (entry.ready && entry.ready.hand_off !== 'sim') {
+    if (entry.ready?.hand_off === 'sim') {
+      // The newer turn already holds its own handoff: that one is the current
+      // decision, and an older one must not overwrite it.
+      this.logger.debug('[asc-flow] keeping the newer parked handoff over a late one', { cod, reason });
+      return;
+    }
+    if (entry.ready) {
       this.pushDisplacedBubble(state, cod, entry.ready.resposta);
     }
     entry.ready = ready;
@@ -1364,6 +1370,9 @@ export class AscFlowPlugin extends BaseChannelPlugin {
     // message is the only poll left to deliver the transfer.
     if (entry.ready?.hand_off === 'sim' && entry.text !== text) {
       state.inFlight.delete(codAtendimento);
+      // Same bookkeeping as an ordinary take: the flow may re-send this very
+      // text, and only `lastAnswered` lets that re-send read as a replay.
+      this.rememberAnswered(state, codAtendimento, text);
       this.logger.warn('[asc-flow] delivering a parked handoff on a newer input', {
         instanceId,
         codAtendimento,
@@ -1417,12 +1426,17 @@ export class AscFlowPlugin extends BaseChannelPlugin {
     }
     // Remember what this turn answered: a re-send repeats exactly this text,
     // and that is the trigger for the freshness check.
+    this.rememberAnswered(state, codAtendimento, text);
+    return entry.ready;
+  }
+
+  /** Remember what this turn answered, bounded like the in-flight map. */
+  private rememberAnswered(state: AscFlowInstanceState, codAtendimento: string, text: string): void {
     if (state.lastAnswered.size >= IN_FLIGHT_MAX_ENTRIES) {
       const oldest = state.lastAnswered.keys().next().value;
       if (oldest !== undefined) state.lastAnswered.delete(oldest);
     }
     state.lastAnswered.set(codAtendimento, text.trim());
-    return entry.ready;
   }
 
   /**
