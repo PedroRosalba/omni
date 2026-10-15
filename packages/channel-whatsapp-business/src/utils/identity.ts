@@ -37,7 +37,8 @@ export function toMetaPhone(input: string): string {
 /**
  * Format a Meta phone (digits-only) back to canonical E.164 with leading `+`.
  *
- * Used when emitting events that the rest of Omni expects in E.164 form.
+ * Not used for event chat ids: those stay digits-only (`toWaId` / inbound
+ * `from`), so outbound and inbound land in the same chat.
  */
 export function toE164(metaPhone: string): string {
   const digits = metaPhone.replace(/\D/g, '');
