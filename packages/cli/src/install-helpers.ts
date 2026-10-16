@@ -127,31 +127,42 @@ export async function startManagedNats(
   );
 }
 
+type RecreateManagedNatsDeps = ManagedNatsPm2 & {
+  binaryExists: () => boolean;
+  /** Reports an invalid stored `server.natsHost`; `omni update` defers it until its spinner stops. */
+  warn: (message: string) => void;
+};
+
+const RECREATE_MANAGED_NATS_DEFAULTS: RecreateManagedNatsDeps = {
+  // Quiet like the pm2 restart it replaces — output would break update's spinner.
+  runPm2: quietPm2,
+  quietPm2,
+  binaryExists: () => existsSync(NATS_BINARY_PATH),
+  warn: (message) => output.warn(message),
+};
+
 /**
- * `omni update` path: recreate omni-nats with the current bind address instead
- * of `pm2 restart`, which would keep the arguments of an older install. Returns
- * null when it cannot recreate (no managed binary, or an invalid stored
- * `server.natsHost`) so the caller falls back to a plain restart.
+ * `omni restart` / `omni update` / `omni doctor --fix` path: recreate omni-nats
+ * with the current bind address instead of `pm2 restart`, which would keep the
+ * arguments of an older process. Returns null when it cannot recreate (no
+ * managed binary, or an invalid stored `server.natsHost`) so the caller falls
+ * back to a plain restart.
  */
-export async function recreateManagedNatsForUpdate(
+export async function recreateManagedNats(
   serverConfig: Pick<ServerConfig, 'dataDir' | 'natsHost'>,
-  deps: ManagedNatsPm2 & { binaryExists: () => boolean } = {
-    // Quiet like the pm2 restart it replaces — output would break update's spinner.
-    runPm2: quietPm2,
-    quietPm2,
-    binaryExists: () => existsSync(NATS_BINARY_PATH),
-  },
+  overrides: Partial<RecreateManagedNatsDeps> = {},
 ): Promise<number | null> {
-  if (!deps.binaryExists()) return null;
+  const { binaryExists, warn, ...pm2 } = { ...RECREATE_MANAGED_NATS_DEFAULTS, ...overrides };
+  if (!binaryExists()) return null;
   let host: string;
   try {
     host = resolveNatsHost(serverConfig);
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
-    output.warn(`${reason}\n  Restarting ${PM2_PROCESSES.nats} with its previous arguments.`);
+    warn(`${reason}\n  Restarting ${PM2_PROCESSES.nats} with its previous arguments.`);
     return null;
   }
-  return startManagedNats({ dataDir: serverConfig.dataDir, host }, deps);
+  return startManagedNats({ dataDir: serverConfig.dataDir, host }, pm2);
 }
 
 // ----------------------------------------------------------------------------

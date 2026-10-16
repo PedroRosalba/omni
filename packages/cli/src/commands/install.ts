@@ -41,7 +41,7 @@ import {
 import { resolveCanonicalPgservePreference } from '../lib/canonical-pgserve.js';
 import { NATS_BINARY_PATH, ensureNats } from '../nats-install.js';
 import * as output from '../output.js';
-import { PM2_PROCESSES, buildPm2StartArgs, getPm2LogDir, isPm2Available, runPm2 } from '../pm2.js';
+import { PM2_PROCESSES, buildPm2StartArgs, capturePm2, getPm2LogDir, isPm2Available, runPm2 } from '../pm2.js';
 import { buildEmbeddedDatabaseUrl, buildRuntimeEnv } from '../runtime-env.js';
 import { getServerBundlePath, getServerLauncherPath } from '../server-bundle.js';
 import { generateApiKey, maskApiKey } from '../utils/keys.js';
@@ -219,8 +219,8 @@ async function startServices(
   const runtimeEnv = buildInstallRuntimeEnv(cfg, forceCleanup, useCanonicalPgserve);
 
   // Delete existing processes so the new hardened flags take effect (reinstall path).
+  // omni-nats is deleted by startManagedNats below, right before it is recreated.
   await runPm2(['delete', PM2_PROCESSES.api]);
-  await runPm2(['delete', PM2_PROCESSES.nats]);
 
   const apiSpinner = ora(`Starting ${PM2_PROCESSES.api} on port ${cfg.port}...`).start();
   const apiArgs = buildPm2StartArgs({
@@ -242,6 +242,8 @@ async function startServices(
     if (natsCode !== 0) natsSpinner.warn(`${PM2_PROCESSES.nats} failed to start — check NATS binary`);
     else natsSpinner.succeed(`${PM2_PROCESSES.nats} started`);
   } else {
+    // Nothing to recreate it with; drop a stale entry pointing at the missing binary.
+    await capturePm2('delete', PM2_PROCESSES.nats);
     output.warn(`NATS binary not found at ${NATS_BINARY_PATH} — skipping`);
   }
   return true;

@@ -24,7 +24,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildAgentHandoffBlock, createInstallCommand } from '../commands/install.js';
 import { loadServerConfig, setConfigValue } from '../config.js';
-import { buildSystemdNatsUnit, recreateManagedNatsForUpdate, resolveManagedNatsHost } from '../install-helpers.js';
+import { buildSystemdNatsUnit, recreateManagedNats, resolveManagedNatsHost } from '../install-helpers.js';
 import { NATS_BINARY_PATH } from '../nats-install.js';
 import { buildNatsServerArgs } from '../nats-server-args.js';
 import { PM2_PROCESSES, buildPm2StartArgs } from '../pm2.js';
@@ -207,10 +207,12 @@ describe('omni install — managed NATS bind address', () => {
     expect(src).toContain('resolveManagedNatsHost(loadServerConfig())');
     expect(src).toContain('startManagedNats({ dataDir: cfg.dataDir, host: natsHost })');
     expect(src).not.toContain("'-js'");
+    // startManagedNats already deletes omni-nats quietly; a second, noisy delete is redundant.
+    expect(src).not.toContain("runPm2(['delete', PM2_PROCESSES.nats])");
   });
 });
 
-describe('recreateManagedNatsForUpdate (omni update)', () => {
+describe('recreateManagedNats (omni restart / update / doctor --fix)', () => {
   function fakePm2(code = 0) {
     const calls: string[][] = [];
     return {
@@ -226,7 +228,7 @@ describe('recreateManagedNatsForUpdate (omni update)', () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'omni-update-nats-'));
     const pm2 = fakePm2();
     try {
-      const code = await recreateManagedNatsForUpdate(
+      const code = await recreateManagedNats(
         { dataDir, natsHost: '127.0.0.1' },
         { runPm2: pm2.runPm2, quietPm2: pm2.runPm2, binaryExists: () => true },
       );
@@ -246,7 +248,7 @@ describe('recreateManagedNatsForUpdate (omni update)', () => {
 
   test('returns null (caller restarts as before) when the managed binary is missing', async () => {
     const pm2 = fakePm2();
-    const code = await recreateManagedNatsForUpdate(
+    const code = await recreateManagedNats(
       { dataDir: '/tmp/unused', natsHost: '127.0.0.1' },
       { runPm2: pm2.runPm2, quietPm2: pm2.runPm2, binaryExists: () => false },
     );
@@ -256,12 +258,29 @@ describe('recreateManagedNatsForUpdate (omni update)', () => {
 
   test('returns null without touching pm2 when the stored server.natsHost is invalid', async () => {
     const pm2 = fakePm2();
-    const code = await recreateManagedNatsForUpdate(
+    const warnings: string[] = [];
+    const code = await recreateManagedNats(
       { dataDir: '/tmp/unused', natsHost: 'bad host' },
-      { runPm2: pm2.runPm2, quietPm2: pm2.runPm2, binaryExists: () => true },
+      { runPm2: pm2.runPm2, quietPm2: pm2.runPm2, binaryExists: () => true, warn: (m) => warnings.push(m) },
     );
     expect(code).toBeNull();
     expect(pm2.calls).toHaveLength(0);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain('previous arguments');
+  });
+
+  test('omni restart recreates omni-nats instead of pm2-restarting it', () => {
+    const src = readFileSync(new URL('../commands/restart.ts', import.meta.url).pathname, 'utf-8');
+    expect(src).toContain('recreateManagedNats(serverConfig');
+    expect(src).not.toContain('PM2_PROCESSES.api, PM2_PROCESSES.nats');
+  });
+
+  test('omni update collects restart warnings and prints them after the spinner stops', () => {
+    const src = readFileSync(new URL('../commands/update.ts', import.meta.url).pathname, 'utf-8');
+    expect(src).toContain('warn: (message) => warnings.push(message)');
+    const stop = src.indexOf('restartSpinner.stop();');
+    expect(stop).toBeGreaterThan(-1);
+    expect(src.indexOf('for (const warning of restartWarnings) output.warn(warning);')).toBeGreaterThan(stop);
   });
 });
 

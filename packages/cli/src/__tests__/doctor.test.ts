@@ -241,7 +241,7 @@ async function recordPm2(state: HarnessState, args: string[], env?: Record<strin
 
   // The cli-key-valid fix handler uses runPm2 to restart; flipping
   // keyFixApplied here lets the recheck pick up the "fixed" state.
-  if (args[0] === 'restart' || args[0] === 'start') {
+  if (args[0] === 'restart' || args[0] === 'start' || args[0] === 'recreate') {
     state.keyFixApplied = true;
     if (state.pm2DriftAfterFix) state.pm2Drift = false;
     if (state.maxRestartsAfterFix !== undefined) state.apiMaxRestarts = state.maxRestartsAfterFix;
@@ -253,7 +253,7 @@ async function recordPm2(state: HarnessState, args: string[], env?: Record<strin
     state.pm2ConfOutput = state.pm2ConfAfterFix;
   }
 
-  if (args[0] === 'restart') reclaimPortAfterRestart(state, args[1]);
+  if (args[0] === 'restart' || args[0] === 'recreate') reclaimPortAfterRestart(state, args[1]);
 
   return state.pm2ExitCode;
 }
@@ -309,6 +309,8 @@ function mkDeps(state: HarnessState): DoctorDeps {
     loadState: () => ({ serverConfig: state.serverConfig, cliConfig: state.cliConfig }),
     // Stubbed side-effects. Tests record pm2 calls here instead of spawning pm2.
     runPm2: async (args: string[], env?: Record<string, string>) => recordPm2(state, args, env),
+    // Recorded as a pseudo pm2 verb so tests can tell a recreate from `pm2 restart omni-nats`.
+    restartNats: async () => recordPm2(state, ['recreate', 'omni-nats']),
     saveCliConfig: (config: Config) => {
       state.cliConfig = { ...state.cliConfig, ...config };
     },
@@ -1273,9 +1275,10 @@ describe('runDoctor — port-canonical-owner --fix', () => {
     // a graceful exit on first signal).
     const term = state.processKillCalls.find((c) => c.pid === 9999 && c.signal === 'SIGTERM');
     expect(term).toBeDefined();
-    // pm2 restart omni-nats was issued so pm2 reclaims 4222.
-    const restart = state.pm2Calls.find((c) => c.args[0] === 'restart' && c.args[1] === 'omni-nats');
-    expect(restart).toBeDefined();
+    // omni-nats was recreated (not pm2-restarted, which keeps old args) so pm2 reclaims 4222.
+    const recreate = state.pm2Calls.find((c) => c.args[0] === 'recreate' && c.args[1] === 'omni-nats');
+    expect(recreate).toBeDefined();
+    expect(state.pm2Calls.find((c) => c.args[0] === 'restart' && c.args[1] === 'omni-nats')).toBeUndefined();
     // Recheck shows the port is now owned by the pm2 child PID.
     const check = report.checks.find((c) => c.id === 'port-canonical-owner');
     expect(check?.level).toBe('OK');
@@ -1354,8 +1357,8 @@ describe('runDoctor — pm2-status --fix dispatches port reconciliation', () => 
 
     // The orphan was killed.
     expect(state.processKillCalls.find((c) => c.pid === 9999)).toBeDefined();
-    // pm2 restart omni-nats was issued.
-    expect(state.pm2Calls.find((c) => c.args[0] === 'restart' && c.args[1] === 'omni-nats')).toBeDefined();
+    // omni-nats was recreated so the current server.natsHost applies.
+    expect(state.pm2Calls.find((c) => c.args[0] === 'recreate' && c.args[1] === 'omni-nats')).toBeDefined();
     // The pm2-status fix entry mentions the reclaim outcome.
     const fix = report.fixesApplied.find((f) => f.includes('reclaimed') || f.includes('restarted omni-nats'));
     expect(fix).toBeDefined();

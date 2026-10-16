@@ -58,7 +58,7 @@ import {
   saveServerConfig,
 } from '../config.js';
 import { getHealthCheckUrl } from '../health.js';
-import { PM2_LOGROTATE_SETTINGS } from '../install-helpers.js';
+import { PM2_LOGROTATE_SETTINGS, recreateManagedNats } from '../install-helpers.js';
 import {
   type EmbeddedDumpResult,
   dumpEmbeddedDb,
@@ -208,6 +208,11 @@ export interface DoctorDeps {
    * to prevent fix handlers from actually mutating the host's pm2 state.
    */
   runPm2: (args: string[], env?: Record<string, string>) => Promise<number>;
+  /**
+   * Bring omni-nats back up with the current `server.natsHost`: recreate it
+   * (pm2 restart would keep the old args), falling back to `pm2 restart`.
+   */
+  restartNats: () => Promise<number>;
   /** Persist a new CLI config. Tests stub this to in-memory state. */
   saveCliConfig: (config: Config) => void;
   /** Re-read the CLI config from disk (stubbed in tests). */
@@ -370,6 +375,7 @@ function productionDeps(): DoctorDeps {
       cliConfig: loadLocalRuntimeConfig(),
     }),
     runPm2,
+    restartNats: async () => (await recreateManagedNats(loadServerConfig())) ?? runPm2(['restart', PM2_PROCESSES.nats]),
     saveCliConfig: saveLocalRuntimeConfig,
     reloadCliConfig: loadLocalRuntimeConfig,
     generateApiKey,
@@ -1047,6 +1053,11 @@ async function waitForPortRelease(deps: DoctorDeps, pid: number, port: number): 
   return false;
 }
 
+/** `pm2 restart <name>`, except omni-nats is recreated so `server.natsHost` applies. */
+function restartManagedProcess(deps: DoctorDeps, name: string): Promise<number> {
+  return name === PM2_PROCESSES.nats ? deps.restartNats() : deps.runPm2(['restart', name]);
+}
+
 /**
  * Reconcile a single (service, port) pair. Returns a human-readable
  * outcome ("reclaimed ...", "SKIPPED ...", "FAILED ...") or null when
@@ -1078,7 +1089,7 @@ async function reclaimPortFromSquatter(
   }
   // pm2 restart so the managed entry can bind. Idempotent against
   // status=online (pm2 just rolls the process).
-  const code = await deps.runPm2(['restart', name]);
+  const code = await restartManagedProcess(deps, name);
   if (code !== 0) {
     return `FAILED ${name}:${port} pm2 restart exited ${code} after killing pid=${ownerPid}`;
   }
@@ -1130,7 +1141,7 @@ async function restartNonOnlineProcesses(deps: DoctorDeps): Promise<string[]> {
   for (const name of [PM2_PROCESSES.api, PM2_PROCESSES.nats]) {
     const entry = processes.find((p) => p.name === name);
     if (entry?.pm2_env?.status !== 'online') {
-      const code = await deps.runPm2(['restart', name]);
+      const code = await restartManagedProcess(deps, name);
       if (code === 0) restarted.push(name);
     }
   }
