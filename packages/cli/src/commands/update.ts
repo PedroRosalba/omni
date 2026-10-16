@@ -30,7 +30,7 @@ import { Command } from 'commander';
 import ora from 'ora';
 import { type Config, loadConfig, loadLocalRuntimeConfig, loadServerConfig, saveConfig } from '../config.js';
 import { getHealthCheckUrl } from '../health.js';
-import { recreateManagedNats } from '../install-helpers.js';
+import { recreateManagedNatsForUpdate } from '../install-helpers.js';
 import { type CleanupReport, cleanupLegacyArtifacts } from '../legacy-cleanup.js';
 import * as output from '../output.js';
 import { PM2_PROCESSES } from '../pm2.js';
@@ -230,7 +230,7 @@ async function restartPm2Services(processNames: Pm2ProcessName[], warnings: stri
     // omni-nats is recreated, not restarted, so server.natsHost applies to
     // installs whose process predates it (pm2 restart keeps the old args).
     if (name === PM2_PROCESSES.nats) {
-      const natsCode = await recreateManagedNats(serverConfig, { warn: (message) => warnings.push(message) });
+      const natsCode = await recreateManagedNatsForUpdate(serverConfig, { warn: (message) => warnings.push(message) });
       if (natsCode !== null) {
         if (natsCode !== 0) allSucceeded = false;
         continue;

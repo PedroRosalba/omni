@@ -24,7 +24,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildAgentHandoffBlock, createInstallCommand } from '../commands/install.js';
 import { loadServerConfig, setConfigValue } from '../config.js';
-import { buildSystemdNatsUnit, recreateManagedNats, resolveManagedNatsHost } from '../install-helpers.js';
+import {
+  buildSystemdNatsUnit,
+  natsBindDriftWarning,
+  recreateManagedNatsForUpdate,
+  resolveManagedNatsHost,
+} from '../install-helpers.js';
 import { NATS_BINARY_PATH } from '../nats-install.js';
 import { buildNatsServerArgs } from '../nats-server-args.js';
 import { PM2_PROCESSES, buildPm2StartArgs } from '../pm2.js';
@@ -212,7 +217,7 @@ describe('omni install — managed NATS bind address', () => {
   });
 });
 
-describe('recreateManagedNats (omni restart / update / doctor --fix)', () => {
+describe('recreateManagedNatsForUpdate (omni update)', () => {
   function fakePm2(code = 0) {
     const calls: string[][] = [];
     return {
@@ -228,7 +233,7 @@ describe('recreateManagedNats (omni restart / update / doctor --fix)', () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'omni-update-nats-'));
     const pm2 = fakePm2();
     try {
-      const code = await recreateManagedNats(
+      const code = await recreateManagedNatsForUpdate(
         { dataDir, natsHost: '127.0.0.1' },
         { runPm2: pm2.runPm2, quietPm2: pm2.runPm2, binaryExists: () => true },
       );
@@ -248,7 +253,7 @@ describe('recreateManagedNats (omni restart / update / doctor --fix)', () => {
 
   test('returns null (caller restarts as before) when the managed binary is missing', async () => {
     const pm2 = fakePm2();
-    const code = await recreateManagedNats(
+    const code = await recreateManagedNatsForUpdate(
       { dataDir: '/tmp/unused', natsHost: '127.0.0.1' },
       { runPm2: pm2.runPm2, quietPm2: pm2.runPm2, binaryExists: () => false },
     );
@@ -259,7 +264,7 @@ describe('recreateManagedNats (omni restart / update / doctor --fix)', () => {
   test('returns null without touching pm2 when the stored server.natsHost is invalid', async () => {
     const pm2 = fakePm2();
     const warnings: string[] = [];
-    const code = await recreateManagedNats(
+    const code = await recreateManagedNatsForUpdate(
       { dataDir: '/tmp/unused', natsHost: 'bad host' },
       { runPm2: pm2.runPm2, quietPm2: pm2.runPm2, binaryExists: () => true, warn: (m) => warnings.push(m) },
     );
@@ -269,18 +274,45 @@ describe('recreateManagedNats (omni restart / update / doctor --fix)', () => {
     expect(warnings[0]).toContain('previous arguments');
   });
 
-  test('omni restart recreates omni-nats instead of pm2-restarting it', () => {
-    const src = readFileSync(new URL('../commands/restart.ts', import.meta.url).pathname, 'utf-8');
-    expect(src).toContain('recreateManagedNats(serverConfig');
-    expect(src).not.toContain('PM2_PROCESSES.api, PM2_PROCESSES.nats');
-  });
-
   test('omni update collects restart warnings and prints them after the spinner stops', () => {
     const src = readFileSync(new URL('../commands/update.ts', import.meta.url).pathname, 'utf-8');
     expect(src).toContain('warn: (message) => warnings.push(message)');
     const stop = src.indexOf('restartSpinner.stop();');
     expect(stop).toBeGreaterThan(-1);
     expect(src.indexOf('for (const warning of restartWarnings) output.warn(warning);')).toBeGreaterThan(stop);
+  });
+});
+
+describe('natsBindDriftWarning (omni restart / doctor)', () => {
+  const ARGS = ['-js', '-sd', '/tmp/data/nats'];
+
+  test('null when omni-nats runs with the configured address', () => {
+    expect(natsBindDriftWarning([...ARGS, '-a', '127.0.0.1'], {})).toBeNull();
+    expect(natsBindDriftWarning([...ARGS, '--addr', '10.0.0.5'], { natsHost: '10.0.0.5' })).toBeNull();
+  });
+
+  test('a process without -a listens on all interfaces', () => {
+    expect(natsBindDriftWarning(ARGS, { natsHost: '0.0.0.0' })).toBeNull();
+    const warning = natsBindDriftWarning(ARGS, {});
+    expect(warning).toContain('listens on 0.0.0.0, but server.natsHost is 127.0.0.1');
+    expect(warning).toContain('omni stop && omni start');
+  });
+
+  test('warns when the configured address changed after the process was created', () => {
+    expect(natsBindDriftWarning([...ARGS, '-a', '127.0.0.1'], { natsHost: '0.0.0.0' })).toContain(
+      'listens on 127.0.0.1, but server.natsHost is 0.0.0.0',
+    );
+  });
+
+  test('null when the running args are unknown or the stored host is invalid', () => {
+    expect(natsBindDriftWarning(undefined, {})).toBeNull();
+    expect(natsBindDriftWarning(ARGS, { natsHost: 'bad host' })).toBeNull();
+  });
+
+  test('omni restart warns instead of recreating omni-nats', () => {
+    const src = readFileSync(new URL('../commands/restart.ts', import.meta.url).pathname, 'utf-8');
+    expect(src).toContain("runPm2(['restart', PM2_PROCESSES.api, PM2_PROCESSES.nats], env)");
+    expect(src).toContain('natsBindDriftWarning(await getRunningNatsArgs(), serverConfig)');
   });
 });
 

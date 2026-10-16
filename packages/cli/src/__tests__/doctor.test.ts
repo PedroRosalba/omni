@@ -56,6 +56,8 @@ interface HarnessState {
   apiPid: number | undefined;
   /** omni-nats pm2 child PID. Used by port-canonical-owner. */
   natsPid: number | undefined;
+  /** omni-nats script args as pm2 recorded them. Used by nats-bind-address. */
+  natsArgs?: string[];
   /**
    * Map of port → owning PID (or null when nothing listens). Stubs the
    * `ss -tlnp` lookup. Healthy default has each canonical port owned by
@@ -241,7 +243,7 @@ async function recordPm2(state: HarnessState, args: string[], env?: Record<strin
 
   // The cli-key-valid fix handler uses runPm2 to restart; flipping
   // keyFixApplied here lets the recheck pick up the "fixed" state.
-  if (args[0] === 'restart' || args[0] === 'start' || args[0] === 'recreate') {
+  if (args[0] === 'restart' || args[0] === 'start') {
     state.keyFixApplied = true;
     if (state.pm2DriftAfterFix) state.pm2Drift = false;
     if (state.maxRestartsAfterFix !== undefined) state.apiMaxRestarts = state.maxRestartsAfterFix;
@@ -253,7 +255,7 @@ async function recordPm2(state: HarnessState, args: string[], env?: Record<strin
     state.pm2ConfOutput = state.pm2ConfAfterFix;
   }
 
-  if (args[0] === 'restart' || args[0] === 'recreate') reclaimPortAfterRestart(state, args[1]);
+  if (args[0] === 'restart') reclaimPortAfterRestart(state, args[1]);
 
   return state.pm2ExitCode;
 }
@@ -291,6 +293,7 @@ function mkDeps(state: HarnessState): DoctorDeps {
             status: state.natsStatus,
             env: {},
             max_restarts: state.natsMaxRestarts,
+            args: state.natsArgs,
           },
         },
       ];
@@ -309,8 +312,6 @@ function mkDeps(state: HarnessState): DoctorDeps {
     loadState: () => ({ serverConfig: state.serverConfig, cliConfig: state.cliConfig }),
     // Stubbed side-effects. Tests record pm2 calls here instead of spawning pm2.
     runPm2: async (args: string[], env?: Record<string, string>) => recordPm2(state, args, env),
-    // Recorded as a pseudo pm2 verb so tests can tell a recreate from `pm2 restart omni-nats`.
-    restartNats: async () => recordPm2(state, ['recreate', 'omni-nats']),
     saveCliConfig: (config: Config) => {
       state.cliConfig = { ...state.cliConfig, ...config };
     },
@@ -386,7 +387,7 @@ describe('runDoctor — read-only mode', () => {
 
     const report = await runDoctor({ fix: false }, deps);
 
-    expect(report.checks).toHaveLength(13);
+    expect(report.checks).toHaveLength(14);
     const ids = report.checks.map((c) => c.id);
     expect(ids).toEqual([
       'pm2-env-drift',
@@ -402,11 +403,12 @@ describe('runDoctor — read-only mode', () => {
       'pgserve-canonical',
       'port-canonical-owner',
       'embedded-data-orphaned',
+      'nats-bind-address',
     ]);
     for (const check of report.checks) {
       expect(check.level).toBe('OK');
     }
-    expect(report.summary).toEqual({ ok: 13, warn: 0, fail: 0 });
+    expect(report.summary).toEqual({ ok: 14, warn: 0, fail: 0 });
     expect(report.fixesApplied).toEqual([]);
   });
 
@@ -1275,10 +1277,9 @@ describe('runDoctor — port-canonical-owner --fix', () => {
     // a graceful exit on first signal).
     const term = state.processKillCalls.find((c) => c.pid === 9999 && c.signal === 'SIGTERM');
     expect(term).toBeDefined();
-    // omni-nats was recreated (not pm2-restarted, which keeps old args) so pm2 reclaims 4222.
-    const recreate = state.pm2Calls.find((c) => c.args[0] === 'recreate' && c.args[1] === 'omni-nats');
-    expect(recreate).toBeDefined();
-    expect(state.pm2Calls.find((c) => c.args[0] === 'restart' && c.args[1] === 'omni-nats')).toBeUndefined();
+    // pm2 restart omni-nats was issued so pm2 reclaims 4222.
+    const restart = state.pm2Calls.find((c) => c.args[0] === 'restart' && c.args[1] === 'omni-nats');
+    expect(restart).toBeDefined();
     // Recheck shows the port is now owned by the pm2 child PID.
     const check = report.checks.find((c) => c.id === 'port-canonical-owner');
     expect(check?.level).toBe('OK');
@@ -1357,10 +1358,40 @@ describe('runDoctor — pm2-status --fix dispatches port reconciliation', () => 
 
     // The orphan was killed.
     expect(state.processKillCalls.find((c) => c.pid === 9999)).toBeDefined();
-    // omni-nats was recreated so the current server.natsHost applies.
-    expect(state.pm2Calls.find((c) => c.args[0] === 'recreate' && c.args[1] === 'omni-nats')).toBeDefined();
+    // pm2 restart omni-nats was issued.
+    expect(state.pm2Calls.find((c) => c.args[0] === 'restart' && c.args[1] === 'omni-nats')).toBeDefined();
     // The pm2-status fix entry mentions the reclaim outcome.
     const fix = report.fixesApplied.find((f) => f.includes('reclaimed') || f.includes('restarted omni-nats'));
     expect(fix).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// nats-bind-address: warn (never fix) when omni-nats runs on an old address
+// ---------------------------------------------------------------------------
+
+describe('runDoctor — nats-bind-address', () => {
+  const NATS_ARGS = ['-js', '-sd', '/tmp/data/nats'];
+
+  test('OK when omni-nats runs with the configured address', async () => {
+    const state = mkHarness({ natsArgs: [...NATS_ARGS, '-a', '127.0.0.1'] });
+    const report = await runDoctor({ fix: false }, mkDeps(state));
+    expect(report.checks.find((c) => c.id === 'nats-bind-address')?.level).toBe('OK');
+  });
+
+  test('WARN when omni-nats predates the bind address (no -a, all interfaces)', async () => {
+    const state = mkHarness({ natsArgs: NATS_ARGS });
+    const report = await runDoctor({ fix: false }, mkDeps(state));
+    const check = report.checks.find((c) => c.id === 'nats-bind-address');
+    expect(check?.level).toBe('WARN');
+    expect(check?.detail).toContain('listens on 0.0.0.0');
+    expect(check?.detail).toContain('omni stop && omni start');
+  });
+
+  test("--fix leaves omni-nats alone — applying the address is the user's call", async () => {
+    const state = mkHarness({ natsArgs: [...NATS_ARGS, '-a', '0.0.0.0'] });
+    const report = await runDoctor({ fix: true }, mkDeps(state));
+    expect(report.checks.find((c) => c.id === 'nats-bind-address')?.level).toBe('WARN');
+    expect(state.pm2Calls.filter((c) => c.args.includes('omni-nats'))).toEqual([]);
   });
 });

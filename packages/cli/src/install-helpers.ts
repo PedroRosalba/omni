@@ -142,13 +142,12 @@ const RECREATE_MANAGED_NATS_DEFAULTS: RecreateManagedNatsDeps = {
 };
 
 /**
- * `omni restart` / `omni update` / `omni doctor --fix` path: recreate omni-nats
- * with the current bind address instead of `pm2 restart`, which would keep the
- * arguments of an older process. Returns null when it cannot recreate (no
- * managed binary, or an invalid stored `server.natsHost`) so the caller falls
- * back to a plain restart.
+ * `omni update` path: recreate omni-nats with the current bind address instead
+ * of `pm2 restart`, which would keep the arguments of an older install. Returns
+ * null when it cannot recreate (no managed binary, or an invalid stored
+ * `server.natsHost`) so the caller falls back to a plain restart.
  */
-export async function recreateManagedNats(
+export async function recreateManagedNatsForUpdate(
   serverConfig: Pick<ServerConfig, 'dataDir' | 'natsHost'>,
   overrides: Partial<RecreateManagedNatsDeps> = {},
 ): Promise<number | null> {
@@ -163,6 +162,48 @@ export async function recreateManagedNats(
     return null;
   }
   return startManagedNats({ dataDir: serverConfig.dataDir, host }, pm2);
+}
+
+/** nats-server flags that set the listen address. */
+const NATS_ADDR_FLAGS = new Set(['-a', '--addr', '--net']);
+
+/**
+ * Warning for an omni-nats that listens on a different address than
+ * `server.natsHost`. `omni restart` and `omni doctor --fix` use `pm2 restart`,
+ * which keeps the arguments the process was created with, so a changed
+ * setting needs `omni stop && omni start`; this tells the user instead of
+ * recreating the process for them. Null when the addresses match, when the
+ * running args are unknown, or when the stored host is invalid.
+ */
+export function natsBindDriftWarning(
+  runningArgs: string[] | undefined,
+  serverConfig: Pick<ServerConfig, 'natsHost'>,
+): string | null {
+  if (!runningArgs) return null;
+  let host: string;
+  try {
+    host = resolveNatsHost(serverConfig);
+  } catch {
+    return null;
+  }
+  const flag = runningArgs.findIndex((arg) => NATS_ADDR_FLAGS.has(arg));
+  // Without an address flag nats-server listens on all interfaces.
+  const running = flag >= 0 ? runningArgs[flag + 1] : '0.0.0.0';
+  if (running === host) return null;
+  return `${PM2_PROCESSES.nats} listens on ${running}, but server.natsHost is ${host}.\n  pm2 restart keeps the old address — run 'omni stop && omni start' to apply it.`;
+}
+
+/** Script args of the running omni-nats from `pm2 jlist`; undefined if unknown. */
+export async function getRunningNatsArgs(): Promise<string[] | undefined> {
+  try {
+    const { code, stdout } = await capturePm2('jlist');
+    if (code !== 0 || !stdout.trim()) return undefined;
+    const processes = JSON.parse(stdout) as Array<{ name?: string; pm2_env?: { args?: unknown } }>;
+    const args = processes.find((p) => p.name === PM2_PROCESSES.nats)?.pm2_env?.args;
+    return Array.isArray(args) ? args.map(String) : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 // ----------------------------------------------------------------------------
