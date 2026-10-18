@@ -277,6 +277,20 @@ export interface MessageReceivedPayload {
   };
   replyToId?: string;
   /**
+   * Typed quote of the replied-to message (additive to `replyToId`; absent when
+   * the message is not a reply). `fromMe` is true only when the quoted sender is
+   * proven to be this instance's own account.
+   */
+  replyTo?: {
+    externalId: string;
+    chatId: string;
+    participant?: string;
+    fromMe: boolean;
+    type: string;
+    isVoiceNote?: boolean;
+    text?: string;
+  };
+  /**
    * Observer-independent authorship (#1148): the id of the Omni instance in
    * the SAME tenant whose own account sent this message, or absent when the
    * sender is not one of our instances. Unlike `rawPayload.key.fromMe`, which
@@ -695,6 +709,8 @@ export interface ReactionReceivedPayload {
   isCustomEmoji?: boolean;
   /** Raw platform payload for channel-specific data */
   rawPayload?: Record<string, unknown>;
+  /** The reacted-to message, relative to the receiving instance (additive) */
+  target?: { fromMe: boolean; participant?: string };
 }
 
 export interface ReactionRemovedPayload {
@@ -712,6 +728,8 @@ export interface ReactionRemovedPayload {
   isCustomEmoji?: boolean;
   /** Raw platform payload (carries the reaction's own external id where the platform has one) */
   rawPayload?: Record<string, unknown>;
+  /** The message the reaction was removed from, relative to the receiving instance (additive) */
+  target?: { fromMe: boolean; participant?: string };
 }
 
 /**

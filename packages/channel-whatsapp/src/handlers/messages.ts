@@ -691,6 +691,93 @@ export function extractQuotedContext(msg: WAMessage): QuotedContext | undefined 
   };
 }
 
+/** Message types whose `contextInfo` can carry a quote (stanzaId + quotedMessage). */
+const QUOTE_CARRIER_KEYS = [
+  'extendedTextMessage',
+  'imageMessage',
+  'videoMessage',
+  'documentMessage',
+  'audioMessage',
+  'stickerMessage',
+  'ptvMessage',
+  'locationMessage',
+  'contactMessage',
+  'pollCreationMessage',
+  'pollCreationMessageV2',
+  'pollCreationMessageV3',
+  'pollCreationMessageV5',
+] as const;
+
+/** Typed quote of the message an inbound message replies to (additive to replyToId). */
+export interface InboundReplyTo {
+  externalId: string;
+  chatId: string;
+  participant?: string;
+  fromMe: boolean;
+  type: string;
+  isVoiceNote?: boolean;
+  text?: string;
+}
+
+function findQuoteContextInfo(message: MessageContent): proto.IContextInfo | undefined {
+  const record = message as Record<string, { contextInfo?: proto.IContextInfo | null } | null | undefined>;
+  for (const key of QUOTE_CARRIER_KEYS) {
+    const contextInfo = record[key]?.contextInfo;
+    if (contextInfo?.stanzaId) return contextInfo;
+  }
+  return undefined;
+}
+
+/**
+ * Build the typed `replyTo` of an inbound message: unwraps ephemeral/viewOnce/
+ * document-with-caption envelopes, then reads contextInfo from every quote
+ * carrier. `fromMe` is true only when the quoted participant is proven to be
+ * this instance's own account (phone JID or LID). Undefined when not a reply.
+ */
+export function extractInboundReplyTo(
+  plugin: Pick<WhatsAppPlugin, 'resolveSenderInstanceId'>,
+  instanceId: string,
+  chatId: string,
+  msg: WAMessage,
+): InboundReplyTo | undefined {
+  if (!msg.message) return undefined;
+  const contextInfo = findQuoteContextInfo(unwrapEnvelopes(msg.message));
+  if (!contextInfo?.stanzaId) return undefined;
+
+  const participant = contextInfo.participant || undefined;
+  const quoted = contextInfo.quotedMessage ? unwrapEnvelopes(contextInfo.quotedMessage) : undefined;
+  const content = quoted ? extractContent({ key: msg.key, message: quoted } as WAMessage) : null;
+  const text = content?.text || content?.caption || undefined;
+  return {
+    externalId: contextInfo.stanzaId,
+    chatId: contextInfo.remoteJid || chatId,
+    ...(participant ? { participant } : {}),
+    fromMe: participant ? plugin.resolveSenderInstanceId(instanceId, participant, false) === instanceId : false,
+    type: content?.type ?? 'unknown',
+    ...(quoted?.audioMessage ? { isVoiceNote: quoted.audioMessage.ptt === true } : {}),
+    ...(text ? { text } : {}),
+  };
+}
+
+/**
+ * Describe the reacted-to message relative to THIS line. The reaction key's
+ * fromMe is relative to the reactor, so it is recomputed: in groups from the
+ * target participant, in DMs by comparing it with whether the reactor is us.
+ */
+function buildReactionTarget(
+  plugin: Pick<WhatsAppPlugin, 'resolveSenderInstanceId'>,
+  instanceId: string,
+  key: WAMessageKey | null | undefined,
+  reactorIsThisLine: boolean,
+): { fromMe: boolean; participant?: string } | undefined {
+  if (!key) return undefined;
+  const participant = key.participant || undefined;
+  if (participant) {
+    return { fromMe: plugin.resolveSenderInstanceId(instanceId, participant, false) === instanceId, participant };
+  }
+  return { fromMe: reactorIsThisLine === (key.fromMe === true) };
+}
+
 // Note: replaceMentionsWithNames removed - mention replacement now handled in
 // agent-dispatcher with database lookup for better reliability across API restarts
 
@@ -939,6 +1026,12 @@ async function handleSpecialMessage(
       content.emoji || '',
       content.targetMessageId || '',
       isFromMe(msg),
+      buildReactionTarget(
+        plugin,
+        instanceId,
+        msg.message ? unwrapEnvelopes(msg.message).reactionMessage?.key : undefined,
+        isFromMe(msg),
+      ),
     );
     return true;
   }
@@ -1359,6 +1452,7 @@ export function setupMessageHandlers(
         reaction.text || '',
         messageId,
         reaction.key?.fromMe || false,
+        buildReactionTarget(plugin, instanceId, key, reaction.key?.fromMe || false),
       );
     }
   });

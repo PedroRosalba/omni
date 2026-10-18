@@ -339,6 +339,53 @@ describe('WhatsAppPlugin', () => {
       });
     });
 
+    async function quotedKeyFor(metadata: Record<string, unknown>) {
+      let quoted: unknown;
+      await withHumanDelayDisabled(async () => {
+        const plugin = new WhatsAppPlugin();
+        const sendMessage = mock((_jid: string, _content: unknown, _options?: { quoted?: unknown }) =>
+          Promise.resolve({ key: { id: 'SENT-ID' }, message: {} }),
+        );
+        const mockSocket = {
+          sendMessage,
+          sendPresenceUpdate: mock(async () => {}),
+          user: { id: '5511999999999@s.whatsapp.net' },
+        };
+        (plugin as any).sockets = new Map([[INSTANCE_ID, mockSocket]]);
+        (plugin as any).eventBus = { publish: mock(async () => {}) };
+        (plugin as any).logger = { info: mock(), debug: mock(), warn: mock(), error: mock() };
+
+        const result = await plugin.sendMessage(INSTANCE_ID, {
+          to: GROUP_JID,
+          content: { type: 'text', text: 'reply' },
+          replyTo: 'QUOTED-ID',
+          metadata,
+        } as any);
+        expect(result.success).toBe(true);
+        quoted = sendMessage.mock.calls[0]?.[2]?.quoted;
+      });
+      return quoted as { key?: Record<string, unknown> };
+    }
+
+    it('no new input: the no-row fallback quoted key stays fromMe=false without participant', async () => {
+      const quoted = await quotedKeyFor({});
+      expect(quoted.key).toEqual({ id: 'QUOTED-ID', remoteJid: GROUP_JID, fromMe: false });
+    });
+
+    it('replyToKey fromMe and participant reach the fallback quoted key when the row is missing', async () => {
+      const quoted = await quotedKeyFor({ replyToFromMe: true, replyToParticipant: PARTICIPANT });
+      expect(quoted.key).toEqual({ id: 'QUOTED-ID', remoteJid: GROUP_JID, fromMe: true, participant: PARTICIPANT });
+    });
+
+    it('no new input: a stored rawPayload is still quoted as-is', async () => {
+      const rawPayload = {
+        key: { id: 'QUOTED-ID', remoteJid: GROUP_JID, fromMe: false },
+        message: { conversation: 'x' },
+      };
+      const quoted = await quotedKeyFor({ replyToFromMe: false, replyToRawPayload: rawPayload });
+      expect(quoted).toBe(rawPayload);
+    });
+
     it('emits caption and media metadata for sent media messages', async () => {
       await withHumanDelayDisabled(async () => {
         const plugin = new WhatsAppPlugin();
@@ -396,6 +443,127 @@ describe('WhatsAppPlugin', () => {
           senderAgentId: undefined,
         });
       });
+    });
+  });
+
+  describe('inbound quotes and reaction targets (additive)', () => {
+    const INSTANCE_ID = 'inbound-instance';
+    const CHAT = '5511888888888@s.whatsapp.net';
+    const OTHER = '5511888888888@s.whatsapp.net';
+
+    function createPluginWithEventBus() {
+      const plugin = new WhatsAppPlugin();
+      const publish = mock(async (_type: string, _payload: unknown) => {});
+      (plugin as any).sockets = new Map([[INSTANCE_ID, { user: { id: '5511999999999:3@s.whatsapp.net' } }]]);
+      (plugin as any).eventBus = { publish };
+      (plugin as any).logger = { info: mock(), debug: mock(), warn: mock(), error: mock() };
+      return { plugin, publish };
+    }
+
+    function published(publish: ReturnType<typeof mock>, type: string): Record<string, unknown> {
+      const call = publish.mock.calls.find(([t]) => t === type);
+      expect(call).toBeDefined();
+      return call?.[1] as Record<string, unknown>;
+    }
+
+    it('no new input: an inbound text reply still yields today replyToId and rawPayload.quotedMessage', async () => {
+      const { plugin, publish } = createPluginWithEventBus();
+      const msg = {
+        key: { id: 'REPLY-1', remoteJid: CHAT, fromMe: false },
+        message: {
+          extendedTextMessage: {
+            text: 'reply',
+            contextInfo: { stanzaId: 'QUOTED-1', participant: OTHER, quotedMessage: { conversation: 'original' } },
+          },
+        },
+      };
+
+      await plugin.handleMessageReceived(
+        INSTANCE_ID,
+        'REPLY-1',
+        CHAT,
+        '5511888888888',
+        { type: 'text', text: 'reply' },
+        'QUOTED-1',
+        msg as any,
+        false,
+      );
+
+      const payload = published(publish, 'message.received');
+      expect(payload.replyToId).toBe('QUOTED-1');
+      expect((payload.rawPayload as Record<string, unknown>).quotedMessage).toEqual({
+        stanzaId: 'QUOTED-1',
+        participant: OTHER,
+        type: 'text',
+        conversation: 'original',
+        pushName: undefined,
+      });
+      expect(payload.replyTo).toEqual({
+        externalId: 'QUOTED-1',
+        chatId: CHAT,
+        participant: OTHER,
+        fromMe: false,
+        type: 'text',
+        text: 'original',
+      });
+    });
+
+    it('no new input: a message without a quote has no replyTo key', async () => {
+      const { plugin, publish } = createPluginWithEventBus();
+      const msg = { key: { id: 'PLAIN-1', remoteJid: CHAT, fromMe: false }, message: { conversation: 'hi' } };
+
+      await plugin.handleMessageReceived(
+        INSTANCE_ID,
+        'PLAIN-1',
+        CHAT,
+        '5511888888888',
+        { type: 'text', text: 'hi' },
+        undefined,
+        msg as any,
+        false,
+      );
+
+      const payload = published(publish, 'message.received');
+      expect(payload).not.toHaveProperty('replyTo');
+      expect(payload.replyToId).toBeUndefined();
+      expect(payload.rawPayload).not.toHaveProperty('quotedMessage');
+    });
+
+    it('no new input: reaction events without a target carry no target key', async () => {
+      const { plugin, publish } = createPluginWithEventBus();
+
+      await plugin.handleReactionReceived(INSTANCE_ID, 'R-1', CHAT, '5511888888888', '👍', 'MSG-1', false);
+      await plugin.handleReactionReceived(INSTANCE_ID, 'R-2', CHAT, '5511888888888', '', 'MSG-1', false);
+
+      expect(published(publish, 'reaction.received')).toEqual({
+        messageId: 'MSG-1',
+        chatId: CHAT,
+        from: '5511888888888',
+        emoji: '👍',
+        rawPayload: { externalId: 'R-1', isFromMe: false },
+      });
+      expect(published(publish, 'reaction.removed')).toEqual({
+        messageId: 'MSG-1',
+        chatId: CHAT,
+        from: '5511888888888',
+        emoji: '',
+        rawPayload: { externalId: 'R-2', isFromMe: false },
+      });
+    });
+
+    it('reaction.received and reaction.removed carry the supplied target', async () => {
+      const { plugin, publish } = createPluginWithEventBus();
+      const target = { fromMe: true, participant: '100000000000001@lid' };
+
+      await plugin.handleReactionReceived(INSTANCE_ID, 'R-1', CHAT, '5511888888888', '✅', 'MSG-1', false, target);
+      await plugin.handleReactionReceived(INSTANCE_ID, 'R-2', CHAT, '5511888888888', '', 'MSG-1', false, {
+        fromMe: false,
+      });
+
+      const received = published(publish, 'reaction.received');
+      expect(received.target).toEqual(target);
+      expect(received.rawPayload).toEqual({ externalId: 'R-1', isFromMe: false });
+      expect(published(publish, 'reaction.removed').target).toEqual({ fromMe: false });
     });
   });
 });

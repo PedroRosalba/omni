@@ -45,7 +45,12 @@ import {
   seedAuthenticated,
   setupConnectionHandlers,
 } from './handlers/connection';
-import { extractQuotedContext, setupMessageHandlers, tryDownloadMedia } from './handlers/messages';
+import {
+  extractInboundReplyTo,
+  extractQuotedContext,
+  setupMessageHandlers,
+  tryDownloadMedia,
+} from './handlers/messages';
 import { fromJid, isGroupJid, isLidJid, isUserJid, toGroupJid, toJid } from './jid';
 import { buildMessageContent } from './senders/builders';
 import { computeWaid } from './senders/contact';
@@ -1340,10 +1345,18 @@ export class WhatsAppPlugin extends BaseChannelPlugin {
     // If we have the full rawPayload, use it directly (this is a WAMessage)
     if (replyToRawPayload) return { quoted: replyToRawPayload };
 
-    // Fallback: construct quoted object with text content for preview
+    // Fallback: construct quoted object with text content for preview.
+    // replyToParticipant comes from the caller's replyToKey hint (no stored row).
+    const replyToParticipant =
+      typeof message.metadata?.replyToParticipant === 'string' ? message.metadata.replyToParticipant : undefined;
     return {
       quoted: {
-        key: { id: message.replyTo, remoteJid: jid, fromMe: replyToFromMe },
+        key: {
+          id: message.replyTo,
+          remoteJid: jid,
+          fromMe: replyToFromMe,
+          ...(replyToParticipant ? { participant: replyToParticipant } : {}),
+        },
         message: replyToText ? { conversation: replyToText } : {},
       },
     };
@@ -3290,6 +3303,9 @@ export class WhatsAppPlugin extends BaseChannelPlugin {
     // Journey timing: capture T0 (platform) and T1 (plugin received)
     const timings = platformTimestamp ? this.captureInboundTimings(platformTimestamp, subStages) : undefined;
 
+    // Typed, additive quote of the replied-to message (absent when not a reply)
+    const typedReplyTo = extractInboundReplyTo(this, instanceId, chatId, rawMessage);
+
     const correlationId = await this.emitMessageReceived({
       instanceId,
       externalId,
@@ -3304,6 +3320,7 @@ export class WhatsAppPlugin extends BaseChannelPlugin {
         mimeType: content.mimeType,
       },
       replyToId,
+      ...(typedReplyTo ? { replyTo: typedReplyTo } : {}),
       senderInstanceId: this.resolveSenderInstanceId(instanceId, from, isFromMe),
       rawPayload: extendedPayload,
       timings,
@@ -3327,6 +3344,7 @@ export class WhatsAppPlugin extends BaseChannelPlugin {
     emoji: string,
     targetMessageId: string,
     isFromMe: boolean,
+    target?: { fromMe: boolean; participant?: string },
   ): Promise<void> {
     // Note: We process fromMe reactions to capture reactions made from the phone
     // In WhatsApp, empty emoji string = reaction removed
@@ -3339,6 +3357,7 @@ export class WhatsAppPlugin extends BaseChannelPlugin {
         from,
         emoji,
         rawPayload: { externalId, isFromMe },
+        ...(target ? { target } : {}),
       });
     } else {
       await this.emitReactionRemoved({
@@ -3348,6 +3367,7 @@ export class WhatsAppPlugin extends BaseChannelPlugin {
         from,
         emoji: '', // WhatsApp doesn't tell us which emoji was removed
         rawPayload: { externalId, isFromMe },
+        ...(target ? { target } : {}),
       });
     }
   }

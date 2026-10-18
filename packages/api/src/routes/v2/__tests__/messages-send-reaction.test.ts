@@ -17,6 +17,7 @@ type MountOptions = {
   messageChatId?: string;
   getByIdThrows?: boolean;
   getByIdError?: Error;
+  storedParticipant?: string;
 };
 
 function mountMessagesRoutes(options: MountOptions = {}): Hono<{ Variables: AppVariables }> {
@@ -78,6 +79,7 @@ function mountMessagesRoutes(options: MountOptions = {}): Hono<{ Variables: AppV
                     id: MESSAGE_EXTERNAL_ID,
                     remoteJid: CHAT_EXTERNAL_ID,
                     fromMe: false,
+                    ...(options.storedParticipant ? { participant: options.storedParticipant } : {}),
                   },
                 },
               }
@@ -203,6 +205,122 @@ describe('POST /messages/send/reaction', () => {
         targetMessageId: externalMessageId,
       },
       metadata: {},
+    });
+  });
+});
+
+async function postReactionBody(app: Hono<{ Variables: AppVariables }>, body: Record<string, unknown>) {
+  return app.request('/messages/send/reaction', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ instanceId: INSTANCE_ID, to: CHAT_ID, messageId: MESSAGE_EXTERNAL_ID, ...body }),
+  });
+}
+
+function okReactionSend() {
+  return mock(async (_instanceId: string, _message: unknown) => ({
+    success: true,
+    messageId: 'REACTION-MSG-ID',
+    timestamp: 123,
+  }));
+}
+
+describe('POST /messages/send/reaction additive inputs (remove, targetKey)', () => {
+  test('no new input: a non-empty emoji without targetKey sends today message and metadata', async () => {
+    const sendMessage = okReactionSend();
+    const app = mountMessagesRoutes({ sendMessage, storedParticipant: '178035101794451@lid' });
+
+    const res = await postReactionBody(app, { emoji: '👍' });
+
+    expect(res.status).toBe(200);
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage.mock.calls[0]?.[0]).toBe(INSTANCE_ID);
+    expect(sendMessage.mock.calls[0]?.[1]).toEqual({
+      to: CHAT_EXTERNAL_ID,
+      content: { type: 'reaction', emoji: '👍', targetMessageId: MESSAGE_EXTERNAL_ID },
+      metadata: { fromMe: false, targetParticipant: '178035101794451@lid' },
+    });
+  });
+
+  test("emoji '' is accepted and sends a removal", async () => {
+    const sendMessage = okReactionSend();
+    const res = await postReactionBody(mountMessagesRoutes({ sendMessage }), { emoji: '' });
+
+    expect(res.status).toBe(200);
+    expect(sendMessage.mock.calls[0]?.[1]).toMatchObject({
+      content: { type: 'reaction', emoji: '', targetMessageId: MESSAGE_EXTERNAL_ID },
+      metadata: { fromMe: false },
+    });
+  });
+
+  test('remove: true sends a removal whatever emoji is given', async () => {
+    const sendMessage = okReactionSend();
+    const res = await postReactionBody(mountMessagesRoutes({ sendMessage }), { emoji: '👍', remove: true });
+
+    expect(res.status).toBe(200);
+    expect((sendMessage.mock.calls[0]?.[1] as { content: { emoji: string } }).content.emoji).toBe('');
+  });
+
+  test('remove: false leaves a non-empty emoji untouched', async () => {
+    const sendMessage = okReactionSend();
+    await postReactionBody(mountMessagesRoutes({ sendMessage }), { emoji: '👍', remove: false });
+
+    expect((sendMessage.mock.calls[0]?.[1] as { content: { emoji: string } }).content.emoji).toBe('👍');
+  });
+
+  test('emoji is still required', async () => {
+    const sendMessage = okReactionSend();
+    const res = await postReactionBody(mountMessagesRoutes({ sendMessage }), { remove: true });
+
+    expect(res.status).toBe(400);
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  for (const emoji of ['⏳', '✅', '❌', '✋']) {
+    test(`accepts the status emoji ${emoji}`, async () => {
+      const sendMessage = okReactionSend();
+      const res = await postReactionBody(mountMessagesRoutes({ sendMessage }), { emoji });
+
+      expect(res.status).toBe(200);
+      expect((sendMessage.mock.calls[0]?.[1] as { content: { emoji: string } }).content.emoji).toBe(emoji);
+    });
+  }
+
+  test('targetKey overrides the stored fromMe and participant', async () => {
+    const sendMessage = okReactionSend();
+    const app = mountMessagesRoutes({ sendMessage, storedParticipant: '178035101794451@lid' });
+
+    await postReactionBody(app, {
+      emoji: '✅',
+      targetKey: { fromMe: false, participant: '5511777777777@s.whatsapp.net' },
+    });
+
+    expect((sendMessage.mock.calls[0]?.[1] as { metadata: unknown }).metadata).toEqual({
+      fromMe: false,
+      targetParticipant: '5511777777777@s.whatsapp.net',
+    });
+  });
+
+  test('targetKey without participant drops the stored targetParticipant', async () => {
+    const sendMessage = okReactionSend();
+    const app = mountMessagesRoutes({ sendMessage, storedParticipant: '178035101794451@lid' });
+
+    await postReactionBody(app, { emoji: '✅', targetKey: { fromMe: true } });
+
+    expect((sendMessage.mock.calls[0]?.[1] as { metadata: unknown }).metadata).toEqual({ fromMe: true });
+  });
+
+  test('targetKey overrides the plugin default when the target is not stored', async () => {
+    const sendMessage = okReactionSend();
+    await postReactionBody(mountMessagesRoutes({ sendMessage }), {
+      messageId: 'EXTERNAL-NOT-IN-DB',
+      emoji: '⏳',
+      targetKey: { fromMe: false, participant: '178035101794451@lid' },
+    });
+
+    expect(sendMessage.mock.calls[0]?.[1]).toMatchObject({
+      content: { targetMessageId: 'EXTERNAL-NOT-IN-DB' },
+      metadata: { fromMe: false, targetParticipant: '178035101794451@lid' },
     });
   });
 });
