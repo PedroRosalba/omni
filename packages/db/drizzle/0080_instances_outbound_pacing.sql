@@ -1,0 +1,21 @@
+-- Opt-in immediate outbound pacing per instance (Vox fluid-chat PR-B).
+--
+-- The WhatsApp Baileys plugin holds every outbound send behind a humanized
+-- random delay and a typing simulation (anti-ban protection). Both switches
+-- were process-wide env vars only. This column lets one instance opt out:
+--
+--   instances.outbound_pacing  'humanized' (default) | 'immediate'
+--
+-- The default 'humanized' keeps every existing row and deployment on today's
+-- behaviour; only an explicit 'immediate' (or a per-request `pacing` field)
+-- skips the delay and the typing simulation.
+--
+-- Numbering: open PR #1294 also claims 0080. Per the parallel-worktree rule,
+-- whichever PR merges second renumbers its own migration (file, journal idx,
+-- tag and `when`); the migration that landed first is never renumbered.
+--
+-- Hand-written following the 0043/0044/0052 precedent (additive, idempotent).
+-- No explicit BEGIN/COMMIT — the boot migrator executes this file on a pooled
+-- postgres-js connection, which rejects raw transaction control.
+
+ALTER TABLE "instances" ADD COLUMN IF NOT EXISTS "outbound_pacing" varchar(20) DEFAULT 'humanized' NOT NULL;

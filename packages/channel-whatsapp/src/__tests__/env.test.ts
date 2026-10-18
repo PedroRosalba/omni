@@ -1,8 +1,10 @@
 import { describe, expect, test } from 'bun:test';
 import {
   DEFAULT_WHATSAPP_OUTBOUND_TIMING,
+  DEFAULT_WHATSAPP_PRESENCE_HOLD,
   DEFAULT_WHATSAPP_RATE_LIMIT,
   getWhatsAppOutboundTimingConfig,
+  getWhatsAppPresenceHoldConfig,
   getWhatsAppRateLimitConfig,
 } from '../env';
 
@@ -67,5 +69,42 @@ describe('WhatsApp env config', () => {
       maxBackoffMs: 5000,
       jitterFactor: 0,
     });
+  });
+
+  test('outbound timing defaults are unchanged by the presence-hold settings', () => {
+    expect(DEFAULT_WHATSAPP_OUTBOUND_TIMING).toEqual({
+      humanDelayEnabled: true,
+      humanDelayMinMs: 1500,
+      humanDelayMaxMs: 3500,
+      typingSimulationEnabled: true,
+      typingDelayBaseMs: 800,
+      typingDelayPerCharMs: 30,
+      typingDelayMaxMs: 4000,
+      typingDefaultMs: 3000,
+    });
+  });
+
+  test('uses presence-hold defaults (10s refresh, 60s max lifetime)', () => {
+    expect(DEFAULT_WHATSAPP_PRESENCE_HOLD).toEqual({ refreshMs: 10_000, maxLifetimeMs: 60_000 });
+    expect(getWhatsAppPresenceHoldConfig({})).toEqual(DEFAULT_WHATSAPP_PRESENCE_HOLD);
+  });
+
+  test('parses presence-hold overrides', () => {
+    expect(
+      getWhatsAppPresenceHoldConfig({
+        WHATSAPP_PRESENCE_REFRESH_MS: '4000',
+        WHATSAPP_PRESENCE_MAX_LIFETIME_MS: '120000',
+      }),
+    ).toEqual({ refreshMs: 4000, maxLifetimeMs: 120_000 });
+  });
+
+  test('presence-hold: zero or invalid values fall back to defaults, lifetime capped at 300000', () => {
+    expect(
+      getWhatsAppPresenceHoldConfig({
+        WHATSAPP_PRESENCE_REFRESH_MS: '0',
+        WHATSAPP_PRESENCE_MAX_LIFETIME_MS: 'nope',
+      }),
+    ).toEqual(DEFAULT_WHATSAPP_PRESENCE_HOLD);
+    expect(getWhatsAppPresenceHoldConfig({ WHATSAPP_PRESENCE_MAX_LIFETIME_MS: '900000' }).maxLifetimeMs).toBe(300_000);
   });
 });

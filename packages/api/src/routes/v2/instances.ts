@@ -96,6 +96,12 @@ const createInstanceSchema = z.object({
     .enum(['convert', 'passthrough'])
     .default('convert')
     .describe('Format conversion: convert markdown to native channel syntax, or passthrough raw text'),
+  outboundPacing: z
+    .enum(['humanized', 'immediate'])
+    .default('humanized')
+    .describe(
+      "Outbound pacing (WhatsApp Baileys): 'humanized' keeps the anti-ban delay and typing simulation before each send; 'immediate' skips both. Send requests can override it with `pacing`",
+    ),
   isDefault: z.boolean().default(false).describe('Set as default instance for channel'),
   token: z.string().optional().describe('Bot token for Discord instances (required for Discord)'),
   ttsVoiceId: z.string().optional().nullable().describe('Default ElevenLabs voice ID for this instance'),
@@ -409,6 +415,8 @@ const updateInstanceSchema = createInstanceSchema
     // omits this key doesn't silently flip the stored value back to false.
     requireGenieSignature: z.boolean().optional(),
     allowFirstParty: z.boolean().optional(),
+    // Strip the .default('humanized') so a PATCH that omits it never resets the stored pacing.
+    outboundPacing: z.enum(['humanized', 'immediate']).optional(),
   })
   // #1211: reject unknown fields (400 naming the key) instead of silently stripping them.
   .strict();

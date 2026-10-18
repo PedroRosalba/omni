@@ -3,6 +3,7 @@
  */
 
 import { describe, expect, it, mock } from 'bun:test';
+import type { OutgoingMessage } from '@omni/channel-sdk';
 import { WHATSAPP_CAPABILITIES } from '../capabilities';
 import { WhatsAppPlugin } from '../plugin';
 import { WhatsAppError } from '../utils/errors';
@@ -396,6 +397,130 @@ describe('WhatsAppPlugin', () => {
           senderAgentId: undefined,
         });
       });
+    });
+  });
+
+  describe('outbound pacing', () => {
+    const INSTANCE_ID = 'pacing-instance';
+    const DM_JID = '5511888888888@s.whatsapp.net';
+
+    type PacingInternals = {
+      sockets: Map<string, unknown>;
+      eventBus: { publish: (type: string, payload: unknown) => Promise<void> };
+      logger: Record<string, unknown>;
+      humanDelay: (instanceId: string) => Promise<void>;
+      simulateTyping: (instanceId: string, jid: string, text: string) => Promise<void>;
+    };
+
+    function createPacingPlugin() {
+      const plugin = new WhatsAppPlugin();
+      const internals = plugin as unknown as PacingInternals;
+      const sendMessage = mock(async () => ({ key: { id: 'PACED-MSG-ID' }, message: { conversation: 'x' } }));
+      internals.sockets = new Map([
+        [
+          INSTANCE_ID,
+          { sendMessage, sendPresenceUpdate: mock(async () => {}), user: { id: '5511999999999@s.whatsapp.net' } },
+        ],
+      ]);
+      internals.eventBus = { publish: mock(async () => {}) };
+      internals.logger = { info: mock(), debug: mock(), warn: mock(), error: mock() };
+      const humanDelay = mock(async (_instanceId: string) => {});
+      const simulateTyping = mock(async (_instanceId: string, _jid: string, _text: string) => {});
+      internals.humanDelay = humanDelay;
+      internals.simulateTyping = simulateTyping;
+      return { plugin, sendMessage, humanDelay, simulateTyping };
+    }
+
+    const textMessage = (metadata?: Record<string, unknown>): OutgoingMessage => ({
+      to: DM_JID,
+      content: { type: 'text', text: 'hello there' },
+      ...(metadata ? { metadata } : {}),
+    });
+
+    const mediaMessage = (metadata: Record<string, unknown> = {}): OutgoingMessage => ({
+      to: DM_JID,
+      content: { type: 'image', caption: 'caption test', filename: 'test.png', mimeType: 'image/png' },
+      metadata: { base64: Buffer.from('image-bytes').toString('base64'), ...metadata },
+    });
+
+    const reactionMessage = (metadata?: Record<string, unknown>): OutgoingMessage => ({
+      to: DM_JID,
+      content: { type: 'reaction', targetMessageId: '3EB0REACTTARGET', emoji: '👍' },
+      ...(metadata ? { metadata } : {}),
+    });
+
+    it('no pacing metadata: text still runs humanDelay then simulateTyping (unchanged)', async () => {
+      const { plugin, sendMessage, humanDelay, simulateTyping } = createPacingPlugin();
+
+      const result = await plugin.sendMessage(INSTANCE_ID, textMessage());
+
+      expect(result.success).toBe(true);
+      expect(humanDelay).toHaveBeenCalledTimes(1);
+      expect(humanDelay.mock.calls[0]).toEqual([INSTANCE_ID]);
+      expect(simulateTyping).toHaveBeenCalledTimes(1);
+      expect(simulateTyping.mock.calls[0]).toEqual([INSTANCE_ID, DM_JID, 'hello there']);
+      expect(sendMessage).toHaveBeenCalledTimes(1);
+    });
+
+    it("explicit 'humanized' behaves like no metadata", async () => {
+      const { plugin, humanDelay, simulateTyping } = createPacingPlugin();
+
+      await plugin.sendMessage(INSTANCE_ID, textMessage({ outboundPacing: 'humanized' }));
+
+      expect(humanDelay).toHaveBeenCalledTimes(1);
+      expect(simulateTyping).toHaveBeenCalledTimes(1);
+    });
+
+    it('immediate: text skips both humanDelay and simulateTyping but still sends', async () => {
+      const { plugin, sendMessage, humanDelay, simulateTyping } = createPacingPlugin();
+
+      const result = await plugin.sendMessage(INSTANCE_ID, textMessage({ outboundPacing: 'immediate' }));
+
+      expect(result.success).toBe(true);
+      expect(humanDelay).not.toHaveBeenCalled();
+      expect(simulateTyping).not.toHaveBeenCalled();
+      expect(sendMessage).toHaveBeenCalledTimes(1);
+    });
+
+    it('no pacing metadata: media still runs humanDelay and simulateTyping (caption)', async () => {
+      const { plugin, humanDelay, simulateTyping } = createPacingPlugin();
+
+      await plugin.sendMessage(INSTANCE_ID, mediaMessage());
+
+      expect(humanDelay).toHaveBeenCalledTimes(1);
+      expect(simulateTyping).toHaveBeenCalledTimes(1);
+      expect(simulateTyping.mock.calls[0]).toEqual([INSTANCE_ID, DM_JID, 'caption test']);
+    });
+
+    it('immediate: media skips both humanDelay and simulateTyping but still sends', async () => {
+      const { plugin, sendMessage, humanDelay, simulateTyping } = createPacingPlugin();
+
+      const result = await plugin.sendMessage(INSTANCE_ID, mediaMessage({ outboundPacing: 'immediate' }));
+
+      expect(result.success).toBe(true);
+      expect(humanDelay).not.toHaveBeenCalled();
+      expect(simulateTyping).not.toHaveBeenCalled();
+      expect(sendMessage).toHaveBeenCalledTimes(1);
+    });
+
+    it('no pacing metadata: reaction still runs humanDelay', async () => {
+      const { plugin, humanDelay } = createPacingPlugin();
+
+      const result = await plugin.sendMessage(INSTANCE_ID, reactionMessage());
+
+      expect(result.success).toBe(true);
+      expect(humanDelay).toHaveBeenCalledTimes(1);
+    });
+
+    it('immediate: reaction skips humanDelay but still sends', async () => {
+      const { plugin, sendMessage, humanDelay, simulateTyping } = createPacingPlugin();
+
+      const result = await plugin.sendMessage(INSTANCE_ID, reactionMessage({ outboundPacing: 'immediate' }));
+
+      expect(result.success).toBe(true);
+      expect(humanDelay).not.toHaveBeenCalled();
+      expect(simulateTyping).not.toHaveBeenCalled();
+      expect(sendMessage).toHaveBeenCalledTimes(1);
     });
   });
 });

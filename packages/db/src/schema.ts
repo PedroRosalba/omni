@@ -934,6 +934,15 @@ export const instances = pgTable(
       .notNull()
       .default('convert')
       .$type<'convert' | 'passthrough'>(),
+    /**
+     * Outbound pacing (WhatsApp Baileys): 'humanized' = anti-ban delay + typing
+     * simulation before each send (default, today's behaviour), 'immediate' =
+     * skip both. A send request's `pacing` field overrides this per message.
+     */
+    outboundPacing: varchar('outbound_pacing', { length: 20 })
+      .notNull()
+      .default('humanized')
+      .$type<'humanized' | 'immediate'>(),
     disableUsernamePrefix: boolean('disable_username_prefix').notNull().default(false),
     processMediaOnBlocked: boolean('process_media_on_blocked').notNull().default(true),
     accessMode: varchar('access_mode', { length: 20 }).notNull().default('blocklist').$type<AccessMode>(),
