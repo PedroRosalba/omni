@@ -173,7 +173,7 @@ describe('instance-scoped consumers (opt-in, 0080)', () => {
   });
 
   test('no new option: instanceIds without scoped: true is ignored, as an unknown field was before', () => {
-    const unscoped = { scoped: false, instanceIds: null, ownerKeyId: null };
+    const unscoped = { scoped: false, instanceIds: null, ownerKeyId: null } as const;
     expect(resolveConsumerScope({ instanceIds: [INST_A] }, restricted)).toEqual(unscoped);
     expect(resolveConsumerScope({ scoped: false, instanceIds: [INST_A] }, unrestricted)).toEqual(unscoped);
     expect(resolveConsumerScope({ instanceIds: ['not-a-uuid', 42] }, undefined)).toEqual(unscoped);
