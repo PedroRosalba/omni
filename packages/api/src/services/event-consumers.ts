@@ -37,6 +37,7 @@ import { ConflictError, NotFoundError, ValidationError, evaluateConditions } fro
 import type { EventBus } from '@omni/core';
 import type {
   AutomationCondition,
+  ConsumerAccessFilter,
   ConsumerLease,
   Database,
   DurableConsumer,
@@ -61,6 +62,12 @@ export interface CreateConsumerInput {
   startFrom?: ConsumerStartFrom;
   /** Competing consumers: pullers on this name split the stream (#1188). Default false = fan-out. */
   shared?: boolean;
+  /**
+   * Opt-in access filter over the ingest verdict (`omni_events.access_decision`).
+   * 'all' (default) adds no predicate. 'allowed'/'denied' require
+   * OMNI_JOURNAL_ACCESS_DECISION=true, otherwise create() refuses with a 400.
+   */
+  access?: ConsumerAccessFilter;
 }
 
 /** A consumer row plus its live lag (journal head minus cursor). */
@@ -151,6 +158,32 @@ export function matchesConsumerPayload(
   return evaluateConditions(filters, row.rawPayload ?? {});
 }
 
+/** Env flag that makes event persistence journal the access verdict (0080). */
+const ACCESS_DECISION_ENV = 'OMNI_JOURNAL_ACCESS_DECISION';
+
+/**
+ * The scanPage predicate for a consumer's access filter: undefined for 'all'
+ * (so the WHERE is exactly the unfiltered one), `access_decision = <filter>`
+ * otherwise. Rows journaled without a decision never match a filtered consumer.
+ */
+export function accessFilterClause(filter: ConsumerAccessFilter | null | undefined): SQL | undefined {
+  return filter === 'allowed' || filter === 'denied' ? eq(omniEvents.accessDecision, filter) : undefined;
+}
+
+/**
+ * Refuse an access-filtered consumer while nothing journals the verdict: it
+ * would match no row. Throws a ValidationError (HTTP 400) naming the env var.
+ */
+function assertAccessFilterAvailable(access: ConsumerAccessFilter | undefined): void {
+  if (access === undefined || access === 'all') return;
+  if (process.env[ACCESS_DECISION_ENV] === 'true') return;
+  throw new ValidationError(
+    `access '${access}' needs ${ACCESS_DECISION_ENV}=true: without it no journal row carries an access decision`,
+    undefined,
+    { access, env: ACCESS_DECISION_ENV },
+  );
+}
+
 /** Initial cursor for a new consumer. Exported for unit tests. */
 export function resolveInitialCursor(startFrom: ConsumerStartFrom, head: number): number {
   return startFrom === 'beginning' ? 0 : head;
@@ -212,6 +245,7 @@ export class EventConsumerService {
   }
 
   async create(input: CreateConsumerInput): Promise<ConsumerWithLag> {
+    assertAccessFilterAvailable(input.access);
     const head = await this.head();
     const cursor = resolveInitialCursor(input.startFrom ?? 'now', head);
 
@@ -225,6 +259,7 @@ export class EventConsumerService {
         cursor,
         shared: input.shared ?? false,
         leaseState: input.shared ? { claimed: cursor, leases: [] } : null,
+        accessFilter: input.access ?? 'all',
       })
       .onConflictDoNothing({ target: durableConsumers.name })
       .returning();
@@ -444,7 +479,9 @@ export class EventConsumerService {
   /**
    * One ascending journal page after the consumer's cursor, pre-filtered by
    * the type filter in SQL (exact match, or trailing-* prefix glob — the
-   * EventService.list / #966 contract) minus the exclude globs (#1078).
+   * EventService.list / #966 contract) minus the exclude globs (#1078), and —
+   * only for an access-filtered consumer — the ingest access verdict (0080).
+   * Every caller (fresh lease, reclaim, pull, withLag's caughtUp) inherits it.
    */
   private async scanPage(
     consumer: DurableConsumer,
@@ -462,6 +499,7 @@ export class EventConsumerService {
           gt(omniEvents.journalSeq, after),
           through === undefined ? undefined : lte(omniEvents.journalSeq, through),
           typeClause,
+          accessFilterClause(consumer.accessFilter),
         ),
       )
       .orderBy(asc(omniEvents.journalSeq))

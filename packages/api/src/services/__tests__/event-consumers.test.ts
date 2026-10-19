@@ -7,9 +7,16 @@
  * automation matcher), initial-cursor resolution, and lag math.
  */
 
-import { describe, expect, test } from 'bun:test';
-import type { SharedLeaseState } from '@omni/db';
+import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
+import { ValidationError } from '@omni/core';
+import type { EventBus } from '@omni/core';
+import type { ConsumerAccessFilter, Database, DurableConsumer, SharedLeaseState } from '@omni/db';
+import { durableConsumers, omniEvents } from '@omni/db';
+import { type SQL, and, gt } from 'drizzle-orm';
+import { PgDialect } from 'drizzle-orm/pg-core';
 import {
+  EventConsumerService,
+  accessFilterClause,
   claimLease,
   computeLag,
   matchesConsumerPayload,
@@ -17,6 +24,7 @@ import {
   releaseLease,
   resolveInitialCursor,
 } from '../event-consumers';
+import { eventTypeFilterClause } from '../events';
 
 describe('matchesConsumerPayload', () => {
   test('no filters = always match (and null filters too)', () => {
@@ -126,5 +134,184 @@ describe('shared consumer leases (#1188)', () => {
     expect(retry.rows).toEqual([1, 2, 3]);
     expect(releaseLease(retry.state, 'crashed')).toBeNull();
     expect(releaseLease(retry.state, 'retry')?.cursor).toBe(3);
+  });
+});
+
+// ============================================================================
+// Opt-in access filter (0080): SQL predicate inside scanPage, gated create
+// ============================================================================
+
+const ENV = 'OMNI_JOURNAL_ACCESS_DECISION';
+
+function render(clause: SQL | undefined): { sql: string; params: unknown[] } {
+  if (!clause) throw new Error('expected a clause');
+  const q = new PgDialect().sqlToQuery(clause);
+  return { sql: q.sql.replace(/\s+/g, ' '), params: q.params };
+}
+
+function consumerRow(overrides: Partial<DurableConsumer> = {}): DurableConsumer {
+  return {
+    id: '00000000-0000-4000-8000-000000000001',
+    name: 'c1',
+    eventType: 'message.received',
+    excludeTypes: null,
+    filters: null,
+    cursor: 0,
+    shared: false,
+    leaseState: null,
+    accessFilter: 'all',
+    createdAt: new Date('2026-01-01'),
+    updatedAt: new Date('2026-01-01'),
+    ...overrides,
+  };
+}
+
+/**
+ * DB-free pool: getByName returns `consumer`, head() returns `head`, the
+ * journal scan returns no rows. Every journal-scan WHERE is captured.
+ */
+function mockPool(consumer: DurableConsumer, head = 0) {
+  const scanWheres: SQL[] = [];
+  const inserted: unknown[] = [];
+  const select = mock((fields?: Record<string, unknown>) => ({
+    from: (table: unknown) => {
+      const rows = table === durableConsumers ? [consumer] : fields && 'head' in fields ? [{ head }] : [];
+      const chain = {
+        where: (cond: SQL) => {
+          if (table === omniEvents) scanWheres.push(cond);
+          return chain;
+        },
+        orderBy: () => chain,
+        limit: () => chain,
+        // biome-ignore lint/suspicious/noThenProperty: drizzle query builders are thenables
+        then: (resolve: (v: unknown) => unknown, reject?: (e: unknown) => unknown) =>
+          Promise.resolve(rows).then(resolve, reject),
+      };
+      return chain;
+    },
+  }));
+  const insert = mock(() => ({
+    values: (v: Record<string, unknown>) => {
+      inserted.push(v);
+      return {
+        onConflictDoNothing: () => ({
+          returning: () =>
+            Promise.resolve([consumerRow({ ...v, cursor: Number(v.cursor) } as Partial<DurableConsumer>)]),
+        }),
+      };
+    },
+  }));
+  return { db: { select, insert } as unknown as Database, select, insert, scanWheres, inserted };
+}
+
+describe('accessFilterClause', () => {
+  test("'all' (and a missing filter) adds no predicate", () => {
+    expect(accessFilterClause('all')).toBeUndefined();
+    expect(accessFilterClause(undefined)).toBeUndefined();
+    expect(accessFilterClause(null)).toBeUndefined();
+  });
+
+  test("'allowed' / 'denied' produce access_decision = <filter>", () => {
+    for (const filter of ['allowed', 'denied'] as const) {
+      const { sql, params } = render(accessFilterClause(filter));
+      expect(sql).toBe('"omni_events"."access_decision" = $1');
+      expect(params).toEqual([filter]);
+    }
+  });
+});
+
+describe('scanPage access predicate (via pull)', () => {
+  function todaysWhere(): { sql: string; params: unknown[] } {
+    // The pre-0080 scanPage WHERE: journal_seq bound + type clause, nothing else.
+    return render(
+      and(gt(omniEvents.journalSeq, 0), undefined, eventTypeFilterClause(['message.received'], undefined)) as SQL,
+    );
+  }
+
+  test("an 'all' consumer scans with exactly the unfiltered WHERE", async () => {
+    const pool = mockPool(consumerRow({ accessFilter: 'all' }));
+    await new EventConsumerService(pool.db).pull('c1');
+    expect(pool.scanWheres).toHaveLength(1);
+    expect(render(pool.scanWheres[0])).toEqual(todaysWhere());
+  });
+
+  test("an 'allowed' / 'denied' consumer gets the eq predicate in SQL", async () => {
+    for (const filter of ['allowed', 'denied'] as ConsumerAccessFilter[]) {
+      const pool = mockPool(consumerRow({ accessFilter: filter }));
+      await new EventConsumerService(pool.db).pull('c1');
+      const { sql, params } = render(pool.scanWheres[0]);
+      expect(sql).toContain('"omni_events"."access_decision" = $');
+      expect(sql.startsWith(todaysWhere().sql.slice(0, -1))).toBe(true);
+      expect(params).toEqual([...todaysWhere().params, filter]);
+    }
+  });
+});
+
+describe('create() access option', () => {
+  let saved: string | undefined;
+  beforeEach(() => {
+    saved = process.env[ENV];
+    delete process.env[ENV];
+  });
+  afterEach(() => {
+    if (saved === undefined) delete process.env[ENV];
+    else process.env[ENV] = saved;
+  });
+
+  function bus() {
+    return { publishGeneric: mock(async () => {}) } as unknown as EventBus & {
+      publishGeneric: ReturnType<typeof mock>;
+    };
+  }
+
+  test('access != all with the env off is a ValidationError naming the env var, before any DB call', async () => {
+    for (const access of ['allowed', 'denied'] as const) {
+      const pool = mockPool(consumerRow());
+      const service = new EventConsumerService(pool.db, bus());
+      const error = await service.create({ name: 'c1', eventType: 'message.received', access }).catch((e) => e);
+      expect(error).toBeInstanceOf(ValidationError);
+      expect(String(error.message)).toContain(ENV);
+      expect(pool.select).not.toHaveBeenCalled();
+      expect(pool.insert).not.toHaveBeenCalled();
+    }
+    process.env[ENV] = 'false';
+    const pool = mockPool(consumerRow());
+    const error = await new EventConsumerService(pool.db)
+      .create({ name: 'c1', eventType: 'x', access: 'denied' })
+      .catch((e) => e);
+    expect(error).toBeInstanceOf(ValidationError);
+  });
+
+  test("default and 'all' store accessFilter 'all' with the env off; created event payload unchanged", async () => {
+    for (const access of [undefined, 'all'] as const) {
+      const pool = mockPool(consumerRow(), 5);
+      const eventBus = bus();
+      const created = await new EventConsumerService(pool.db, eventBus).create({
+        name: 'c1',
+        eventType: 'message.received',
+        ...(access ? { access } : {}),
+      });
+      expect(pool.inserted[0]).toMatchObject({ accessFilter: 'all', cursor: 5 });
+      expect(created.accessFilter).toBe('all');
+      expect(eventBus.publishGeneric).toHaveBeenCalledWith('system.consumer.created', {
+        consumerId: created.id,
+        name: 'c1',
+        eventType: 'message.received',
+        cursor: 5,
+        shared: false,
+      });
+    }
+  });
+
+  test("with the env on, 'allowed' is stored", async () => {
+    process.env[ENV] = 'true';
+    const pool = mockPool(consumerRow(), 5);
+    const created = await new EventConsumerService(pool.db).create({
+      name: 'c1',
+      eventType: 'message.received',
+      access: 'allowed',
+    });
+    expect(pool.inserted[0]).toMatchObject({ accessFilter: 'allowed' });
+    expect(created.accessFilter).toBe('allowed');
   });
 });
