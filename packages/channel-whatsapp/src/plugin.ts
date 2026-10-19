@@ -2005,7 +2005,7 @@ export class WhatsAppPlugin extends BaseChannelPlugin {
    * - 'typing' holds Baileys 'composing', 'recording' holds 'recording'; the
    *   state is re-sent every WHATSAPP_PRESENCE_REFRESH_MS until a send or a
    *   reaction to the chat, a 'paused' call, the max lifetime or an instance
-   *   disconnect.
+   *   disconnect. Reaching the max lifetime also sends 'paused' (best-effort).
    * - 'paused' stops any hold on the chat and sends 'paused'.
    * - maxLifetimeMs omitted or 0 = WHATSAPP_PRESENCE_MAX_LIFETIME_MS; any value
    *   is capped at 300000.
@@ -2050,7 +2050,7 @@ export class WhatsAppPlugin extends BaseChannelPlugin {
       WHATSAPP_PRESENCE_HOLD_LIFETIME_CAP_MS,
     );
     const presence = type === 'recording' ? 'recording' : 'composing';
-    const hold = this.registerPresenceHold(key, lifetimeMs, presence);
+    const hold = this.registerPresenceHold(instanceId, jid, key, lifetimeMs, presence);
     const expiresAt = Date.now() + lifetimeMs;
 
     try {
@@ -2086,17 +2086,44 @@ export class WhatsAppPlugin extends BaseChannelPlugin {
     });
   }
 
-  /** Put a fresh hold, with its lifetime timer, in the registry. */
-  private registerPresenceHold(key: string, lifetimeMs: number, presence: 'composing' | 'recording'): PresenceHold {
+  /**
+   * Put a fresh hold, with its lifetime timer, in the registry. When the
+   * lifetime runs out on the still-live hold, the hold ends and 'paused' is
+   * sent (best-effort) so the chat does not keep showing the indicator. A hold
+   * already replaced or ended has had its timer cleared, and the identity check
+   * keeps a stray fire from pausing a newer hold.
+   */
+  private registerPresenceHold(
+    instanceId: string,
+    jid: string,
+    key: string,
+    lifetimeMs: number,
+    presence: 'composing' | 'recording',
+  ): PresenceHold {
     const hold: PresenceHold = {
       presence,
       lifetime: setTimeout(() => {
-        if (this.presenceHolds.get(key) === hold) this.clearPresenceHold(key);
+        if (this.presenceHolds.get(key) !== hold) return;
+        this.clearPresenceHold(key);
+        this.sendExpiryPause(instanceId, jid);
       }, lifetimeMs),
       endedBy: null,
     };
     this.presenceHolds.set(key, hold);
     return hold;
+  }
+
+  /** Best-effort 'paused' for an expired hold, on the socket current at fire time (a reconnect replaces it). */
+  private sendExpiryPause(instanceId: string, jid: string): void {
+    const current = this.sockets.get(instanceId);
+    if (!current) return;
+    try {
+      current.sendPresenceUpdate('paused', jid).catch(() => {
+        // Best-effort: the indicator also times out on the recipient side
+      });
+    } catch {
+      // Best-effort: a socket that throws synchronously must not escape the timer
+    }
   }
 
   /**

@@ -582,4 +582,78 @@ describe('WhatsAppPlugin.holdPresence', () => {
       expect(presences(calls, 'paused')).toEqual([['presence', 'paused', PHONE_JID]]);
     });
   });
+
+  describe('lifetime expiry', () => {
+    it("sends exactly one 'paused' when the lifetime runs out and refreshes no more", async () => {
+      const { plugin, calls, internals } = createPlugin();
+
+      await plugin.holdPresence(INSTANCE_ID, PHONE, 'typing', 20_000);
+      await advance(19_999);
+      expect(presences(calls, 'paused')).toHaveLength(0);
+
+      await advance(1);
+      expect(internals.presenceHolds.size).toBe(0);
+      expect(presences(calls, 'paused')).toEqual([['presence', 'paused', PHONE_JID]]);
+
+      const composingAtExpiry = presences(calls, 'composing').length;
+      await advance(60_000);
+      expect(presences(calls, 'paused')).toHaveLength(1);
+      expect(presences(calls, 'composing')).toHaveLength(composingAtExpiry);
+      expect(calls.at(-1)).toEqual(['presence', 'paused', PHONE_JID]);
+    });
+
+    it("a hold replaced before its old lifetime fires sends no stale 'paused'", async () => {
+      const { plugin, calls, internals } = createPlugin();
+
+      await plugin.holdPresence(INSTANCE_ID, PHONE, 'typing', 20_000);
+      await advance(10_000);
+      await plugin.holdPresence(INSTANCE_ID, PHONE, 'recording', 60_000);
+
+      // The first hold's lifetime would have ended at 20s.
+      await advance(10_001);
+      expect(presences(calls, 'paused')).toHaveLength(0);
+      expect(internals.presenceHolds.size).toBe(1);
+
+      // The newer hold's own lifetime (60s from its start) pauses once.
+      await advance(49_999);
+      expect(internals.presenceHolds.size).toBe(0);
+      expect(presences(calls, 'paused')).toHaveLength(1);
+    });
+
+    it("a hold ended by 'paused' sends no second 'paused' when its lifetime would have run out", async () => {
+      const { plugin, calls } = createPlugin();
+
+      await plugin.holdPresence(INSTANCE_ID, PHONE, 'typing', 20_000);
+      await plugin.holdPresence(INSTANCE_ID, PHONE, 'paused');
+      await advance(30_000);
+
+      expect(presences(calls, 'paused')).toHaveLength(1);
+    });
+
+    it('no socket at expiry: ends the hold without throwing or sending', async () => {
+      const { plugin, calls, internals } = createPlugin();
+
+      await plugin.holdPresence(INSTANCE_ID, PHONE, 'typing', 5_000);
+      internals.sockets.delete(INSTANCE_ID);
+
+      await advance(5_000);
+      await flush();
+      expect(internals.presenceHolds.size).toBe(0);
+      expect(presences(calls, 'paused')).toHaveLength(0);
+    });
+
+    it("a failing 'paused' at expiry is swallowed", async () => {
+      const { plugin, internals, sock } = createPlugin();
+
+      await plugin.holdPresence(INSTANCE_ID, PHONE, 'typing', 5_000);
+      sock.sendPresenceUpdate.mockImplementation(async () => {
+        throw new Error('socket closed');
+      });
+
+      await advance(5_000);
+      await flush();
+      expect(internals.presenceHolds.size).toBe(0);
+      expect(sock.sendPresenceUpdate).toHaveBeenLastCalledWith('paused', PHONE_JID);
+    });
+  });
 });

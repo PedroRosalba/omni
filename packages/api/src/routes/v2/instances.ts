@@ -6,11 +6,12 @@ import { zValidator } from '@hono/zod-validator';
 import type { ChannelPlugin, ChannelRegistry, GroupParticipantUpdateResult } from '@omni/channel-sdk';
 import { AccessModeSchema, ChannelTypeSchema, NotFoundError, createLogger } from '@omni/core';
 import type { GupshupHandoffOptions } from '@omni/db';
-import { Hono } from 'hono';
+import { type Context, Hono } from 'hono';
 import { z } from 'zod';
 import { accessCache } from '../../cache/cache-keys';
 import { DEFAULT_TURN_SCOPES } from '../../constants/scopes';
 import { agentKeyName } from '../../lib/agent-key-name';
+import { readSignedHostScopeContext } from '../../lib/signed-host-scope-context';
 import { applyWhatsAppBusinessConnectionOptions } from '../../lib/whatsapp-business-connection';
 import { filterByInstanceAccess, requireInstanceAccess } from '../../middleware/auth';
 import { invalidateProviderCacheForInstance } from '../../plugins/agent-dispatcher';
@@ -106,7 +107,7 @@ const createInstanceSchema = z.object({
     .boolean()
     .default(false)
     .describe(
-      "Let send requests choose `pacing: 'immediate'` on a humanized instance. Default false: such requests are refused with 403",
+      "Let send requests choose `pacing: 'immediate'` on a humanized instance. Default false: such requests are refused with 403. Setting it to true needs a full-access ('*') key; any other key gets 403",
     ),
   isDefault: z.boolean().default(false).describe('Set as default instance for channel'),
   token: z.string().optional().describe('Bot token for Discord instances (required for Discord)'),
@@ -1073,6 +1074,32 @@ async function findSlackBotModeConflict(
   return other ? { id: other.id, name: other.name } : null;
 }
 
+/**
+ * Guard: only a full-access ('*') key may turn outboundPacingOverride on —
+ * the flag lets per-request `pacing: 'immediate'` skip the humanized anti-ban
+ * pacing. Omitting it or setting false is open to any key that may write the
+ * instance. Same in-handler 403 shape as requireAdmin in turns.ts; a signed
+ * host must be full-access too, as the scope-ceiling check in keys.ts requires.
+ */
+function denyPacingOverrideForScopedKey(
+  c: Context<{ Variables: AppVariables }>,
+  outboundPacingOverride: boolean | undefined,
+): Response | null {
+  if (outboundPacingOverride !== true) return null;
+  const signedHost = readSignedHostScopeContext(c);
+  const hostAllows = signedHost.kind === 'unsigned' || (signedHost.kind === 'valid' && signedHost.scopes.includes('*'));
+  if (hostAllows && c.get('apiKey')?.scopes.includes('*')) return null;
+  return c.json(
+    {
+      error: {
+        code: 'FORBIDDEN',
+        message: 'Setting outboundPacingOverride to true requires a full-access (*) API key',
+      },
+    },
+    403,
+  );
+}
+
 function slackAppTokenConflictBody(other: { id: string; name: string }) {
   return {
     error: {
@@ -1088,6 +1115,8 @@ function slackAppTokenConflictBody(other: { id: string; name: string }) {
  */
 instancesRoutes.post('/', zValidator('json', createInstanceSchema), async (c) => {
   const { force, ...data } = c.req.valid('json');
+  const pacingDenied = denyPacingOverrideForScopedKey(c, data.outboundPacingOverride);
+  if (pacingDenied) return pacingDenied;
   const services = c.get('services');
 
   // A create carries no workspace yet (the team id is learned on first
@@ -1188,6 +1217,8 @@ instancesRoutes.post('/', zValidator('json', createInstanceSchema), async (c) =>
 instancesRoutes.patch('/:id', instanceAccess, zValidator('json', updateInstanceSchema), async (c) => {
   const id = c.req.param('id');
   const { force, ...data } = c.req.valid('json');
+  const pacingDenied = denyPacingOverrideForScopedKey(c, data.outboundPacingOverride);
+  if (pacingDenied) return pacingDenied;
   const services = c.get('services');
 
   // The conflict is keyed on the PAIR (app token, bot mode), so either field

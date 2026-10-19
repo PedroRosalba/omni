@@ -12,7 +12,8 @@
 -- simulation. A send request's `pacing` field may always ask for 'humanized';
 -- it may ask for 'immediate' only when the instance is already 'immediate' or
 -- the operator set outbound_pacing_override = true (otherwise 403), so an API
--- key cannot defeat a humanized instance on its own.
+-- key cannot defeat a humanized instance on its own. The API lets only a
+-- full-access ('*') key set outbound_pacing_override to true.
 --
 -- Numbering: open PR #1294 also claims 0080. Per the parallel-worktree rule,
 -- whichever PR merges second renumbers its own migration (file, journal idx,

@@ -946,7 +946,8 @@ export const instances = pgTable(
     /**
      * Operator consent for per-request pacing: when false (default) a send
      * request may still ask for 'humanized', but 'immediate' is refused (403)
-     * unless outboundPacing itself is 'immediate'.
+     * unless outboundPacing itself is 'immediate'. Only a full-access ('*')
+     * API key may set it to true (POST/PATCH /instances answer 403 otherwise).
      */
     outboundPacingOverride: boolean('outbound_pacing_override').notNull().default(false),
     disableUsernamePrefix: boolean('disable_username_prefix').notNull().default(false),
