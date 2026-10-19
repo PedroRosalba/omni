@@ -571,16 +571,29 @@ function getPromptOverride(ctx: MediaProcessorContext, contentType: string | und
  * The legacy `process_audio` column is deliberately not consulted: nothing ever
  * honoured it, so lines carrying `false` there keep being transcribed.
  */
+/**
+ * Per-instance cache of the audioTranscription mode only (no credentials), so
+ * the default 'auto' path costs about one instance read per instance per TTL
+ * instead of one per audio message. A changed setting applies within the TTL.
+ */
+const AUDIO_TRANSCRIPTION_MODE_TTL_MS = 30_000;
+const audioTranscriptionModeCache = new Map<string, { mode: 'auto' | 'off'; expiresAt: number }>();
+
 async function readAudioTranscriptionMode(
   ctx: MediaProcessorContext,
   instanceId: string,
   trustedTenantId: string | undefined,
 ): Promise<'auto' | 'off'> {
+  const cacheKey = `${trustedTenantId ?? ''}:${instanceId}`;
+  const cached = audioTranscriptionModeCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) return cached.mode;
   try {
     const instancesService = ctx.services?.instances;
     if (!instancesService) return 'auto';
     const instance = await runMediaDb(ctx, trustedTenantId, () => instancesService.getById(instanceId));
-    return instance?.audioTranscription === 'off' ? 'off' : 'auto';
+    const mode = instance?.audioTranscription === 'off' ? 'off' : 'auto';
+    audioTranscriptionModeCache.set(cacheKey, { mode, expiresAt: Date.now() + AUDIO_TRANSCRIPTION_MODE_TTL_MS });
+    return mode;
   } catch (error) {
     log.debug('Audio transcription mode lookup failed, transcribing as usual', { instanceId, error: String(error) });
     return 'auto';
@@ -970,6 +983,7 @@ export async function setupMediaProcessor(eventBus: EventBus, db: Database, serv
 
 export const __test__ = {
   buildFetchOptions,
+  resetAudioTranscriptionModeCache: () => audioTranscriptionModeCache.clear(),
   persistProcessingResult,
   resolveSafeMediaContentEventId,
   processMessageMedia,

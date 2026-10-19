@@ -12,7 +12,7 @@
  * DB-free: every collaborator of processMessageMedia is mocked.
  */
 
-import { describe, expect, it, mock } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, it, mock } from 'bun:test';
 import type { EventBus, MessageReceivedPayload } from '@omni/core';
 import type { Database } from '@omni/db';
 import type { MediaProcessingService } from '@omni/media-processing';
@@ -131,6 +131,10 @@ function payloadFor(type: 'audio' | 'image', mimeType: string): MessageReceivedP
   } as unknown as MessageReceivedPayload;
 }
 
+// The mode cache is module state: keep it from leaking between tests or into other files.
+beforeEach(() => __test__.resetAudioTranscriptionModeCache());
+afterEach(() => __test__.resetAudioTranscriptionModeCache());
+
 const audioPayload = payloadFor('audio', 'audio/ogg');
 const imagePayload = payloadFor('image', 'image/jpeg');
 
@@ -225,5 +229,22 @@ describe("audio transcription switch — 'off'", () => {
     expect(processed[0]?.payload.content).toBe('a sunset');
     expect(processed[0]?.payload).not.toHaveProperty('skipped');
     expect(ofType(h, 'media.processing.failed')).toHaveLength(0);
+  });
+});
+
+describe('audioTranscription mode cache', () => {
+  it('reads the instance once per TTL for repeated audio on the same instance', async () => {
+    const h = makeHarness({ id: INSTANCE_ID, audioTranscription: 'auto' });
+    await run(h, audioPayload);
+    await run(h, audioPayload);
+    expect(h.getById).toHaveBeenCalledTimes(1);
+    expect(h.process).toHaveBeenCalledTimes(2);
+  });
+
+  it('a failed lookup is not cached', async () => {
+    const h = makeHarness('throw');
+    await run(h, audioPayload);
+    await run(h, audioPayload);
+    expect(h.getById).toHaveBeenCalledTimes(2);
   });
 });
