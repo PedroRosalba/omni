@@ -27,8 +27,12 @@ import {
 import {
   DEFAULT_STREAM_HEARTBEAT_MS,
   DEFAULT_STREAM_POLL_FALLBACK_MS,
+  STREAM_RECONNECT_RETRY_MS,
+  acquireConsumerStreamSlot,
   consumerStreamWakeHub,
   resolveStreamIntervalMs,
+  resolveStreamMaxLifetimeMs,
+  resolveStreamMaxPerProcess,
   resolveStreamStart,
   runConsumerStream,
   wakePrefixesFor,
@@ -111,6 +115,10 @@ eventConsumersRoutes.post('/events/consumers/:name/ack', zValidator('json', AckC
  * Read-only w.r.t. the consumer: the position lives in memory, the stored
  * cursor is never written and no lease is taken (shared consumers are
  * refused). Clients keep acking with POST /events/consumers/:name/ack.
+ * events:write like pull; an instance-restricted key only streams its own
+ * instances' rows (the GET /events rule). Each stream lives at most
+ * EVENT_STREAM_MAX_LIFETIME_MS (the revocation ceiling), then asks the client
+ * to reconnect, which re-authenticates.
  */
 eventConsumersRoutes.get(
   '/events/consumers/:name/stream',
@@ -128,11 +136,30 @@ eventConsumersRoutes.get(
       after: after === undefined ? undefined : Number(after),
       cursor: consumer.cursor,
     });
+    const maxPerProcess = resolveStreamMaxPerProcess();
+    const release = acquireConsumerStreamSlot(maxPerProcess);
+    if (!release) {
+      c.header('Retry-After', String(Math.ceil(STREAM_RECONNECT_RETRY_MS / 1000)));
+      return c.json(
+        {
+          error: {
+            code: 'RATE_LIMITED',
+            message: 'Too many open event streams on this server. Retry shortly or use pull.',
+            details: { limit: maxPerProcess },
+          },
+        },
+        429,
+      );
+    }
     // The request's transaction commits once this handler returns; the stream
     // re-enters the tenant per page (scanForStream) instead of inheriting it.
-    const tenantId = currentTenantScope()?.tenantId ?? null;
+    const access = {
+      tenantId: currentTenantScope()?.tenantId ?? null,
+      instanceIds: c.get('apiKey')?.instanceIds ?? null,
+    };
     const heartbeatMs = resolveStreamIntervalMs(process.env.EVENT_STREAM_HEARTBEAT_MS, DEFAULT_STREAM_HEARTBEAT_MS);
     const fallbackMs = resolveStreamIntervalMs(process.env.STREAM_POLL_FALLBACK_MS, DEFAULT_STREAM_POLL_FALLBACK_MS);
+    const maxLifetimeMs = resolveStreamMaxLifetimeMs();
 
     return streamSSE(c, (stream) =>
       runDetachedFromTenantScope(async () => {
@@ -151,30 +178,41 @@ eventConsumersRoutes.get(
           await write(() =>
             stream.writeSSE({ event: 'connected', data: JSON.stringify({ consumer: consumer.name, after: start }) }),
           );
+          await runConsumerStream({
+            start,
+            scan: (position) => services.eventConsumers.scanForStream(name, position, access),
+            send: (row) =>
+              write(() =>
+                stream.writeSSE({ id: String(row.journalSeq), event: row.eventType, data: JSON.stringify(row) }),
+              ),
+            heartbeat: () =>
+              write(async () => {
+                await stream.write(`: heartbeat ${Date.now()}\n\n`);
+              }),
+            close: (error) =>
+              write(() =>
+                stream.writeSSE({ event: 'error', data: JSON.stringify({ consumer: name, message: error.message }) }),
+              ),
+            expire: (reason) =>
+              write(() =>
+                stream.writeSSE({
+                  event: 'reconnect',
+                  data: JSON.stringify({ consumer: name, reason }),
+                  retry: STREAM_RECONNECT_RETRY_MS,
+                }),
+              ),
+            subscribeWake: (wake) => consumerStreamWakeHub.register(wakePrefixesFor(consumer.eventType), wake),
+            signal: disconnect.signal,
+            heartbeatMs,
+            fallbackMs,
+            maxLifetimeMs,
+            onError: (error) => log.warn('Consumer stream scan failed; retrying', { name, error: String(error) }),
+          });
         } catch {
-          return; // disconnected before the first byte
+          // disconnected before the first byte
+        } finally {
+          release();
         }
-        await runConsumerStream({
-          start,
-          scan: (position) => services.eventConsumers.scanForStream(name, position, tenantId),
-          send: (row) =>
-            write(() =>
-              stream.writeSSE({ id: String(row.journalSeq), event: row.eventType, data: JSON.stringify(row) }),
-            ),
-          heartbeat: () =>
-            write(async () => {
-              await stream.write(`: heartbeat ${Date.now()}\n\n`);
-            }),
-          close: (error) =>
-            write(() =>
-              stream.writeSSE({ event: 'error', data: JSON.stringify({ consumer: name, message: error.message }) }),
-            ),
-          subscribeWake: (wake) => consumerStreamWakeHub.register(wakePrefixesFor(consumer.eventType), wake),
-          signal: disconnect.signal,
-          heartbeatMs,
-          fallbackMs,
-          onError: (error) => log.warn('Consumer stream scan failed; retrying', { name, error: String(error) }),
-        });
       }),
     );
   },

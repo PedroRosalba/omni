@@ -47,6 +47,7 @@ const superUrl = process.env.OMNI_G3_POSTGRES_URL ?? '';
 const postgresDescribe = superUrl.length > 0 ? describe : describe.skip;
 const psqlBin = process.env.OMNI_G3_PSQL_BIN ?? 'psql';
 
+const FULL_ACCESS = { tenantId: null, instanceIds: null };
 const TENANT_A = '11111111-1111-4111-8111-1111111111aa';
 const TENANT_B = '22222222-2222-4222-8222-2222222222bb';
 const INSTANCE_A = '55555555-5555-4555-8555-5555555555aa';
@@ -595,17 +596,17 @@ postgresDescribe('durable event consumers (#989, real PostgreSQL)', () => {
       await fill(first.id, 'f1');
       const hollow = await claim('f2');
 
-      const catchUp = await service.scanForStream('jr-stream', consumer.cursor, null);
+      const catchUp = await service.scanForStream('jr-stream', consumer.cursor, FULL_ACCESS);
       expect(catchUp.items.map((e) => e.id)).toEqual([first.id]);
       expect(catchUp.through).toBe(first.seq);
       expect(catchUp.held).toBe(true);
       expect(catchUp.full).toBe(false);
 
-      const stillHeld = await service.scanForStream('jr-stream', first.seq, null);
+      const stillHeld = await service.scanForStream('jr-stream', first.seq, FULL_ACCESS);
       expect(stillHeld).toEqual({ items: [], through: null, held: true, full: false });
 
       await fill(hollow.id, 'f2');
-      const live = await service.scanForStream('jr-stream', first.seq, null);
+      const live = await service.scanForStream('jr-stream', first.seq, FULL_ACCESS);
       expect(live.items.map((e) => e.id)).toEqual([hollow.id]);
       expect(live.items[0]?.rawPayload).toEqual({ kind: 'jr', tag: 'f2' });
       expect(live.through).toBe(hollow.seq);
@@ -616,7 +617,44 @@ postgresDescribe('durable event consumers (#989, real PostgreSQL)', () => {
 
     test('(g) SSE stream scan refuses a shared consumer', async () => {
       await service.create({ name: 'jr-stream-shared', eventType: 'message.received', shared: true });
-      await expect(service.scanForStream('jr-stream-shared', 0, null)).rejects.toThrow(/shared/);
+      await expect(service.scanForStream('jr-stream-shared', 0, FULL_ACCESS)).rejects.toThrow(/shared/);
+    });
+
+    test('(h) SSE stream scan: an instance-restricted key only receives its instances; a full key receives all', async () => {
+      const [other] = await db
+        .insert(instances)
+        .values({ name: `inst-stream-other-${randomUUID()}`, channel: 'whatsapp-baileys' })
+        .returning();
+      if (!other) throw new Error('instance seed failed');
+      const consumer = await service.create({ name: 'jr-stream-instances', eventType: 'custom.stream.instances' });
+      const seed = async (instance: string): Promise<{ id: string; seq: number }> => {
+        const [inserted] = await db
+          .insert(omniEvents)
+          .values({ channel: 'whatsapp-baileys', instanceId: instance, eventType: 'custom.stream.instances' })
+          .returning();
+        if (!inserted) throw new Error('event seed failed');
+        return { id: inserted.id, seq: Number(inserted.journalSeq) };
+      };
+      const mine1 = await seed(instanceId);
+      const theirs = await seed(other.id);
+      const mine2 = await seed(instanceId);
+
+      const restricted = await service.scanForStream('jr-stream-instances', consumer.cursor, {
+        tenantId: null,
+        instanceIds: [instanceId],
+      });
+      expect(restricted.items.map((e) => e.id)).toEqual([mine1.id, mine2.id]);
+      expect(restricted.through).toBe(mine2.seq);
+
+      const all = await service.scanForStream('jr-stream-instances', consumer.cursor, FULL_ACCESS);
+      expect(all.items.map((e) => e.id)).toEqual([mine1.id, theirs.id, mine2.id]);
+
+      const none = await service.scanForStream('jr-stream-instances', consumer.cursor, {
+        tenantId: null,
+        instanceIds: [],
+      });
+      expect(none.items).toEqual([]);
+      expect((await service.getByName('jr-stream-instances')).cursor).toBe(consumer.cursor);
     });
   });
 

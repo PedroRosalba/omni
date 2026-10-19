@@ -44,7 +44,7 @@ import type {
   SharedLeaseState,
 } from '@omni/db';
 import { durableConsumers, omniEvents } from '@omni/db';
-import { type SQL, and, asc, eq, gt, isNull, lte, sql } from 'drizzle-orm';
+import { type SQL, and, asc, eq, gt, inArray, isNull, lte, sql } from 'drizzle-orm';
 import { runDetachedFromTenantScope, scopedHandle } from '../tenancy/tenant-scope';
 import { runTenantWorkDb } from '../tenancy/worker-tenant-context';
 import { eventTypeFilterClause } from './events';
@@ -123,6 +123,24 @@ export interface StreamScanResult {
   held: boolean;
   /** The page came back full and uncut: more rows are already waiting. */
   full: boolean;
+}
+
+/** Who is reading a stream page: the request's trusted tenant and its API key's instance allow-list. */
+export interface StreamAccess {
+  /** Tenant the request scope resolved (null = legacy credential, ambient pool). */
+  tenantId: string | null;
+  /** The key's `instanceIds` (null = every instance), read exactly as `GET /events` reads it. */
+  instanceIds: readonly string[] | null;
+}
+
+/**
+ * The instance restriction for a stream page: none for a full-access key,
+ * otherwise `instance_id IN (...)` (rows with no instance excluded, as in
+ * `GET /events`), and a match-nothing predicate for an empty allow-list.
+ */
+export function streamInstanceClause(instanceIds: readonly string[] | null): SQL | undefined {
+  if (instanceIds === null) return undefined;
+  return instanceIds.length === 0 ? sql`false` : inArray(omniEvents.instanceId, [...instanceIds]);
 }
 
 /** Rows the stream scans per page (matches are <= this). */
@@ -434,17 +452,21 @@ export class EventConsumerService {
    * short worker transaction of its own for `trustedTenantId` (the tenant the
    * request scope resolved), or on the ambient pool for a legacy credential.
    * The consumer is re-read per page, so a deleted consumer ends the stream.
+   *
+   * An instance-restricted API key only scans its own instances' rows (the
+   * `GET /events` rule), so other instances' rows are never sent and never
+   * hold the page; the position simply moves on past them.
    */
   async scanForStream(
     name: string,
     after: number,
-    trustedTenantId: string | null,
+    access: StreamAccess,
     limit: number = STREAM_PAGE_LIMIT,
   ): Promise<StreamScanResult> {
     return runDetachedFromTenantScope(() =>
-      runTenantWorkDb(this.pool, trustedTenantId, async () => {
+      runTenantWorkDb(this.pool, access.tenantId, async () => {
         const consumer = await this.getStreamable(name);
-        const page = await this.scanPage(consumer, limit, after);
+        const page = await this.scanPage(consumer, limit, after, undefined, streamInstanceClause(access.instanceIds));
         const rows = truncateAtUnready(page, true, resolveConsumerSettleMs(), Date.now());
         const held = rows.length < page.length;
         const last = rows[rows.length - 1];
@@ -577,6 +599,8 @@ export class EventConsumerService {
     limit: number,
     after = consumer.cursor,
     through?: number,
+    /** Extra predicate (the stream's instance restriction); pull never passes one. */
+    extra?: SQL,
   ): Promise<OmniEvent[]> {
     const typeClause = eventTypeFilterClause([consumer.eventType], consumer.excludeTypes ?? undefined);
 
@@ -588,6 +612,7 @@ export class EventConsumerService {
           gt(omniEvents.journalSeq, after),
           through === undefined ? undefined : lte(omniEvents.journalSeq, through),
           typeClause,
+          extra,
         ),
       )
       .orderBy(asc(omniEvents.journalSeq))

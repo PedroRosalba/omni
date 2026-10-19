@@ -10,8 +10,9 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { NotFoundError, ValidationError } from '@omni/core';
 import type { DurableConsumer, OmniEvent } from '@omni/db';
 import { Hono } from 'hono';
+import { SCOPE_MAP } from '../../../constants/scopes';
 import { errorHandler } from '../../../middleware/error';
-import type { StreamScanResult } from '../../../services/event-consumers';
+import type { StreamAccess, StreamScanResult } from '../../../services/event-consumers';
 import type { AppVariables } from '../../../types';
 import { eventConsumersRoutes } from '../event-consumers';
 
@@ -29,18 +30,26 @@ const CONSUMER = {
   updatedAt: new Date(),
 } as unknown as DurableConsumer;
 
-function row(seq: number): OmniEvent {
+function row(seq: number, instanceId = 'inst-a'): OmniEvent {
   return {
     id: `evt-${seq}`,
     journalSeq: seq,
     eventType: 'message.received',
+    instanceId,
     rawPayload: { seq },
   } as unknown as OmniEvent;
 }
 
-function buildApp(options: { journal?: OmniEvent[]; getStreamable?: (name: string) => Promise<DurableConsumer> } = {}) {
+function buildApp(
+  options: {
+    journal?: OmniEvent[];
+    getStreamable?: (name: string) => Promise<DurableConsumer>;
+    instanceIds?: string[] | null;
+  } = {},
+) {
   const journal = options.journal ?? [];
   const scans: number[] = [];
+  const accesses: StreamAccess[] = [];
   const touched: string[] = [];
   const forbidden = (method: string) => async () => {
     touched.push(method);
@@ -49,9 +58,13 @@ function buildApp(options: { journal?: OmniEvent[]; getStreamable?: (name: strin
   const services = {
     eventConsumers: {
       getStreamable: options.getStreamable ?? (async () => CONSUMER),
-      scanForStream: async (_name: string, after: number): Promise<StreamScanResult> => {
+      scanForStream: async (_name: string, after: number, access: StreamAccess): Promise<StreamScanResult> => {
         scans.push(after);
-        const rows = journal.filter((r) => r.journalSeq > after);
+        accesses.push(access);
+        const allowed = access.instanceIds;
+        const rows = journal.filter(
+          (r) => r.journalSeq > after && (allowed === null || allowed.includes(r.instanceId ?? '')),
+        );
         const last = rows[rows.length - 1];
         return { items: rows, through: last ? last.journalSeq : null, held: false, full: false };
       },
@@ -64,10 +77,13 @@ function buildApp(options: { journal?: OmniEvent[]; getStreamable?: (name: strin
   app.onError(errorHandler);
   app.use('*', async (c, next) => {
     c.set('services', services);
+    if (options.instanceIds !== undefined) {
+      c.set('apiKey', { instanceIds: options.instanceIds } as unknown as AppVariables['apiKey']);
+    }
     await next();
   });
   app.route('/api/v2', eventConsumersRoutes);
-  return { app, scans, touched };
+  return { app, scans, touched, accesses };
 }
 
 /** Read SSE text until `until` matches (or the body ends), then cancel the body (client disconnect). */
@@ -85,16 +101,20 @@ async function readUntil(response: Response, until: RegExp): Promise<string> {
   return text;
 }
 
-const saved = { heartbeat: process.env.EVENT_STREAM_HEARTBEAT_MS, fallback: process.env.STREAM_POLL_FALLBACK_MS };
+const ENV_KEYS = [
+  'EVENT_STREAM_HEARTBEAT_MS',
+  'STREAM_POLL_FALLBACK_MS',
+  'EVENT_STREAM_MAX_LIFETIME_MS',
+  'EVENT_STREAM_MAX_PER_PROCESS',
+] as const;
+const saved = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]]));
 beforeEach(() => {
   process.env.EVENT_STREAM_HEARTBEAT_MS = '20';
   process.env.STREAM_POLL_FALLBACK_MS = '10';
 });
 afterEach(() => {
-  for (const [key, value] of [
-    ['EVENT_STREAM_HEARTBEAT_MS', saved.heartbeat],
-    ['STREAM_POLL_FALLBACK_MS', saved.fallback],
-  ] as const) {
+  for (const key of ENV_KEYS) {
+    const value = saved[key];
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
   }
@@ -173,5 +193,56 @@ describe('GET /api/v2/events/consumers/:name/stream', () => {
     const after = scans.length;
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(scans.length).toBe(after);
+  });
+
+  test('an instance-restricted key only receives its instances; a full-access key receives all', async () => {
+    const journal = [row(11, 'inst-a'), row(12, 'inst-b'), row(13, 'inst-a')];
+    const restricted = buildApp({ journal, instanceIds: ['inst-a'] });
+    const mine = await readUntil(await restricted.app.request('/api/v2/events/consumers/vox/stream'), /id: 13\n/);
+    expect(restricted.accesses[0]).toEqual({ tenantId: null, instanceIds: ['inst-a'] });
+    expect(mine).toContain('id: 11\n');
+    expect(mine).not.toContain('id: 12\n');
+
+    const full = buildApp({ journal, instanceIds: null });
+    const all = await readUntil(await full.app.request('/api/v2/events/consumers/vox/stream'), /id: 13\n/);
+    expect(full.accesses[0]).toEqual({ tenantId: null, instanceIds: null });
+    expect(all).toContain('id: 12\n');
+  });
+
+  test('the stream ends at its lifetime with a reconnect event and an SSE retry hint', async () => {
+    process.env.EVENT_STREAM_MAX_LIFETIME_MS = '60';
+    const { app } = buildApp({ journal: [row(11)] });
+    const res = await app.request('/api/v2/events/consumers/vox/stream');
+    const reader = res.body?.getReader();
+    if (!reader) throw new Error('no body');
+    let text = '';
+    for (;;) {
+      const { value, done } = await reader.read(); // the server closes the body itself
+      if (done) break;
+      text += new TextDecoder().decode(value);
+    }
+    expect(text).toContain('id: 11\n');
+    expect(text).toMatch(/event: reconnect\ndata: \{"consumer":"vox","reason":"lifetime"\}\nretry: 1000\n\n$/);
+  });
+
+  test('past EVENT_STREAM_MAX_PER_PROCESS a new stream is refused with 429', async () => {
+    process.env.EVENT_STREAM_MAX_PER_PROCESS = '1';
+    const { app } = buildApp();
+    const open = await app.request('/api/v2/events/consumers/vox/stream');
+    const reader = open.body?.getReader();
+    await reader?.read(); // connected
+    const refused = await app.request('/api/v2/events/consumers/vox/stream');
+    expect(refused.status).toBe(429);
+    expect(JSON.stringify(await refused.json())).toContain('RATE_LIMITED');
+    await reader?.cancel();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const again = await app.request('/api/v2/events/consumers/vox/stream');
+    expect(again.status).toBe(200);
+    await again.body?.cancel();
+  });
+
+  test('requires events:write, the same scope as pull (an events:read key cannot stream)', () => {
+    expect(SCOPE_MAP['GET /events/consumers/:name/stream']).toBe('events:write');
+    expect(SCOPE_MAP['GET /events/consumers/:name/stream']).toBe(SCOPE_MAP['POST /events/consumers/:name/pull']);
   });
 });

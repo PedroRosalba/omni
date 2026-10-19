@@ -21,10 +21,17 @@
  * can beat the persistence fill, so a woken stream re-scans a few times in
  * quick succession, re-scans fast while a held row is pending, and falls back
  * to a fixed interval otherwise (or always, when NATS is unavailable).
+ *
+ * Authority is derived once, at connect. So no stream outlives the RELEASE_SLOS
+ * termination ceiling (STREAM_TERMINATION_CEILING_SECONDS): it ends with a
+ * `reconnect` event carrying an SSE `retry:` hint, and the client reconnects
+ * with Last-Event-ID, which re-runs auth, scopes and tenancy. That bounds a
+ * revoked key or a suspended tenant for legacy and tenant credentials alike.
  */
 
 import { NotFoundError, STREAM_CONFIGS, ValidationError } from '@omni/core';
 import type { OmniEvent } from '@omni/db';
+import { STREAM_TERMINATION_CEILING_SECONDS } from '../tenancy/tenant-stream-subscriptions';
 import type { StreamScanResult } from './event-consumers';
 import { getTurnEventsConnection } from './turn-events';
 
@@ -36,12 +43,68 @@ export const DEFAULT_STREAM_POLL_FALLBACK_MS = 1_000;
 const STREAM_HELD_RESCAN_MS = 100;
 /** Quick re-scans after a wake, for a fill that lands just after the NATS message. */
 const STREAM_WAKE_FOLLOW_UP_MS: readonly number[] = [50, 200, 500];
+/** Minimum gap between wake-driven scans of one stream: a burst of events costs one scan. */
+const STREAM_MIN_WAKE_GAP_MS = 25;
+/** The `retry:` hint sent with the final `reconnect` event (ms). */
+export const STREAM_RECONNECT_RETRY_MS = 1_000;
+/** Longest a stream may live on one authentication (EVENT_STREAM_MAX_LIFETIME_MS default and ceiling). */
+export const STREAM_MAX_LIFETIME_CEILING_MS = STREAM_TERMINATION_CEILING_SECONDS * 1000;
+/** Default per-process cap on open streams (EVENT_STREAM_MAX_PER_PROCESS). */
+const DEFAULT_STREAM_MAX_PER_PROCESS = 100;
 
 /** A positive interval from the environment, or the default. Read per stream. */
 export function resolveStreamIntervalMs(raw: string | undefined, fallback: number): number {
   if (raw === undefined || raw.trim() === '') return fallback;
   const parsed = Number(raw);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+/** EVENT_STREAM_MAX_LIFETIME_MS, clamped to the termination ceiling (which is also the default). */
+export function resolveStreamMaxLifetimeMs(raw: string | undefined = process.env.EVENT_STREAM_MAX_LIFETIME_MS): number {
+  return Math.min(resolveStreamIntervalMs(raw, STREAM_MAX_LIFETIME_CEILING_MS), STREAM_MAX_LIFETIME_CEILING_MS);
+}
+
+/** EVENT_STREAM_MAX_PER_PROCESS: a positive integer, or the default. */
+export function resolveStreamMaxPerProcess(raw: string | undefined = process.env.EVENT_STREAM_MAX_PER_PROCESS): number {
+  const parsed = resolveStreamIntervalMs(raw, DEFAULT_STREAM_MAX_PER_PROCESS);
+  return Number.isInteger(parsed) ? parsed : DEFAULT_STREAM_MAX_PER_PROCESS;
+}
+
+let openStreamSlots = 0;
+
+/**
+ * Reserve one of the process's stream slots, synchronously (so concurrent
+ * requests cannot overshoot the cap). Returns the release function, or null
+ * when `max` streams are already open. Release is idempotent.
+ */
+export function acquireConsumerStreamSlot(max: number): (() => void) | null {
+  if (openStreamSlots >= max) return null;
+  openStreamSlots++;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    openStreamSlots--;
+  };
+}
+
+/** Why a stream ended on the server's initiative (sent in the `reconnect` event). */
+export type StreamEndReason = 'lifetime' | 'shutdown';
+
+const liveStreams = new Set<(reason: StreamEndReason) => Promise<void>>();
+
+/** Open streams in this process (for tests and diagnostics). */
+export function liveConsumerStreamCount(): number {
+  return liveStreams.size;
+}
+
+/**
+ * End every open stream (graceful shutdown, before the DB pool closes): each
+ * sends its `reconnect` event and releases its timers. Resolves when all
+ * have ended.
+ */
+export async function closeAllConsumerStreams(): Promise<void> {
+  await Promise.all([...liveStreams].map((end) => end('shutdown')));
 }
 
 /**
@@ -158,6 +221,10 @@ export interface ConsumerStreamOptions {
   heartbeat: () => Promise<void>;
   /** End the stream with a final error event (consumer deleted or no longer streamable). */
   close: (error: Error) => Promise<void>;
+  /** End the stream with a final `reconnect` event (lifetime reached or server shutdown). */
+  expire: (reason: StreamEndReason) => Promise<void>;
+  /** Server-side lifetime cap (resolveStreamMaxLifetimeMs). */
+  maxLifetimeMs: number;
   /** Register for wake-ups; returns the unregister function. */
   subscribeWake: (wake: () => void) => () => void;
   /** Aborted when the client disconnects. */
@@ -166,6 +233,7 @@ export interface ConsumerStreamOptions {
   fallbackMs: number;
   heldRescanMs?: number;
   wakeFollowUpMs?: readonly number[];
+  minWakeGapMs?: number;
   /** A transient scan failure; the stream retries on the fallback interval. */
   onError?: (error: unknown) => void;
 }
@@ -185,11 +253,13 @@ export async function runConsumerStream(options: ConsumerStreamOptions): Promise
   const { signal, heartbeatMs, fallbackMs } = options;
   const heldRescanMs = options.heldRescanMs ?? STREAM_HELD_RESCAN_MS;
   const wakeFollowUpMs = options.wakeFollowUpMs ?? STREAM_WAKE_FOLLOW_UP_MS;
+  const minWakeGapMs = options.minWakeGapMs ?? STREAM_MIN_WAKE_GAP_MS;
 
   let position = options.start;
   let stopped = false;
   let running = false;
   let dirty = false;
+  let lastScanAt = Number.NEGATIVE_INFINITY;
   let followUps: number[] = [];
   let timer: ReturnType<typeof setTimeout> | undefined;
   let inflight: Promise<void> = Promise.resolve();
@@ -203,6 +273,16 @@ export async function runConsumerStream(options: ConsumerStreamOptions): Promise
   };
   if (signal.aborted) stop();
   else signal.addEventListener('abort', stop, { once: true });
+
+  /** Server-initiated end: let an in-flight scan settle, then send `reconnect` and finish. */
+  const end = async (reason: StreamEndReason): Promise<void> => {
+    if (stopped) return finished;
+    stopped = true;
+    clearTimeout(timer);
+    await inflight.catch(() => undefined);
+    if (!signal.aborted) await options.expire(reason).catch(() => undefined);
+    finish();
+  };
 
   /** Scan and send until the journal is drained or a row is held. */
   const drain = async (): Promise<'held' | 'idle'> => {
@@ -218,15 +298,17 @@ export async function runConsumerStream(options: ConsumerStreamOptions): Promise
     }
   };
 
+  const schedule = (delay: number) => {
+    clearTimeout(timer);
+    if (!stopped) timer = setTimeout(request, delay);
+  };
+
   const cycle = async (): Promise<void> => {
     let next = fallbackMs;
     try {
-      let status: 'held' | 'idle';
-      do {
-        dirty = false;
-        status = await drain();
-      } while (dirty && !stopped);
-      next = status === 'held' ? heldRescanMs : (followUps.shift() ?? fallbackMs);
+      const status = await drain();
+      // A wake during the scan re-scans after the minimum gap, not per event.
+      next = dirty ? minWakeGapMs : status === 'held' ? heldRescanMs : (followUps.shift() ?? fallbackMs);
     } catch (error) {
       if (stopped) return;
       if (isTerminal(error)) {
@@ -237,8 +319,9 @@ export async function runConsumerStream(options: ConsumerStreamOptions): Promise
       options.onError?.(error);
     } finally {
       running = false;
+      dirty = false;
     }
-    if (!stopped) timer = setTimeout(request, next);
+    schedule(next);
   };
 
   function request(): void {
@@ -249,23 +332,36 @@ export async function runConsumerStream(options: ConsumerStreamOptions): Promise
     }
     clearTimeout(timer);
     running = true;
+    lastScanAt = Date.now();
     inflight = cycle();
   }
 
-  const unsubscribe = options.subscribeWake(() => {
+  const onWake = () => {
     followUps = [...wakeFollowUpMs];
-    request();
-  });
+    if (running) {
+      dirty = true;
+      return;
+    }
+    const wait = lastScanAt + minWakeGapMs - Date.now();
+    if (wait <= 0) request();
+    else schedule(wait);
+  };
+
+  liveStreams.add(end);
+  const unsubscribe = options.subscribeWake(onWake);
   const heartbeat = setInterval(() => {
     if (!stopped) options.heartbeat().catch(stop);
   }, heartbeatMs);
+  const lifetime = setTimeout(() => void end('lifetime'), options.maxLifetimeMs);
 
   try {
     request();
     await finished;
   } finally {
     stopped = true;
+    liveStreams.delete(end);
     clearInterval(heartbeat);
+    clearTimeout(lifetime);
     clearTimeout(timer);
     unsubscribe();
     await inflight.catch(() => undefined);

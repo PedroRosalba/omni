@@ -11,16 +11,26 @@
 import { describe, expect, test } from 'bun:test';
 import { NotFoundError } from '@omni/core';
 import { type Database, type DurableConsumer, type OmniEvent, durableConsumers } from '@omni/db';
+import { PgDialect } from 'drizzle-orm/pg-core';
 import {
   type ConsumerStreamOptions,
   ConsumerStreamWakeHub,
+  STREAM_MAX_LIFETIME_CEILING_MS,
+  type StreamEndReason,
   type WakeConnection,
+  acquireConsumerStreamSlot,
+  closeAllConsumerStreams,
+  liveConsumerStreamCount,
   resolveStreamIntervalMs,
+  resolveStreamMaxLifetimeMs,
+  resolveStreamMaxPerProcess,
   resolveStreamStart,
   runConsumerStream,
   wakePrefixesFor,
 } from '../event-consumer-stream';
-import { EventConsumerService, type StreamScanResult } from '../event-consumers';
+import { EventConsumerService, type StreamScanResult, streamInstanceClause } from '../event-consumers';
+
+const FULL_ACCESS = { tenantId: null, instanceIds: null };
 
 const SETTLE_MS = 5_000;
 
@@ -54,7 +64,7 @@ function consumer(extra: Partial<DurableConsumer> = {}): DurableConsumer {
 }
 
 /** A handle that answers the two read chains and throws on any write. */
-function fakePool(registered: DurableConsumer, page: () => OmniEvent[]): Database {
+function fakePool(registered: DurableConsumer, page: () => OmniEvent[], wheres: unknown[] = []): Database {
   const refuse = () => {
     throw new Error('the stream must never write');
   };
@@ -62,7 +72,10 @@ function fakePool(registered: DurableConsumer, page: () => OmniEvent[]): Databas
     select: () => ({
       from: (table: unknown) => {
         const query = {
-          where: () => query,
+          where: (clause: unknown) => {
+            if (table !== durableConsumers) wheres.push(clause);
+            return query;
+          },
           orderBy: () => query,
           limit: async (n: number) => (table === durableConsumers ? [registered] : page().slice(0, n)),
         };
@@ -170,6 +183,7 @@ function harness(options: { journal: OmniEvent[]; match?: (r: OmniEvent) => bool
   let unsubscribed = false;
   let held: ((r: OmniEvent) => boolean) | null = null;
   const closed: Error[] = [];
+  const expired: StreamEndReason[] = [];
   const errors: unknown[] = [];
   let failNext: Error | null = null;
 
@@ -205,6 +219,10 @@ function harness(options: { journal: OmniEvent[]; match?: (r: OmniEvent) => bool
     close: async (error) => {
       closed.push(error);
     },
+    expire: async (reason) => {
+      expired.push(reason);
+    },
+    maxLifetimeMs: 60_000,
     subscribeWake: (w) => {
       wake = w;
       return () => {
@@ -233,6 +251,7 @@ function harness(options: { journal: OmniEvent[]; match?: (r: OmniEvent) => bool
     scans,
     sent,
     closed,
+    expired,
     errors,
     heartbeats: () => heartbeats,
     unsubscribed: () => unsubscribed,
@@ -382,7 +401,7 @@ describe('EventConsumerService.scanForStream (read-only, gate always on)', () =>
   test('a hollow row younger than the settle window is held even when the consumer has no waitForReady', async () => {
     const page = [row(8), row(9, { journalReady: false }), row(10)];
     const service = new EventConsumerService(fakePool(consumer({ waitForReady: false }), () => page));
-    const result = await service.scanForStream('vox', 7, null);
+    const result = await service.scanForStream('vox', 7, FULL_ACCESS);
     expect(seqs(result.items)).toEqual([8]);
     expect(result).toMatchObject({ through: 8, held: true, full: false });
   });
@@ -390,7 +409,7 @@ describe('EventConsumerService.scanForStream (read-only, gate always on)', () =>
   test('a dead hollow row older than the settle window does not stall the stream', async () => {
     const page = [row(8, { journalReady: false, receivedAt: new Date(Date.now() - SETTLE_MS - 1_000) }), row(9)];
     const service = new EventConsumerService(fakePool(consumer(), () => page));
-    const result = await service.scanForStream('vox', 7, null);
+    const result = await service.scanForStream('vox', 7, FULL_ACCESS);
     expect(seqs(result.items)).toEqual([8, 9]);
     expect(result).toMatchObject({ through: 9, held: false });
   });
@@ -399,27 +418,157 @@ describe('EventConsumerService.scanForStream (read-only, gate always on)', () =>
     const page = [row(8, { rawPayload: { kind: 'a' } }), row(9, { rawPayload: { kind: 'b' } })];
     const filtered = consumer({ filters: [{ field: 'kind', operator: 'eq', value: 'a' }] });
     const service = new EventConsumerService(fakePool(filtered, () => page));
-    const result = await service.scanForStream('vox', 7, null);
+    const result = await service.scanForStream('vox', 7, FULL_ACCESS);
     expect(seqs(result.items)).toEqual([8]);
     expect(result.through).toBe(9);
   });
 
   test('a full uncut page reports full; an empty page reports nothing scanned', async () => {
     const rows = [row(8), row(9)];
-    const full = await new EventConsumerService(fakePool(consumer(), () => rows)).scanForStream('vox', 7, null, 2);
+    const full = await new EventConsumerService(fakePool(consumer(), () => rows)).scanForStream(
+      'vox',
+      7,
+      FULL_ACCESS,
+      2,
+    );
     expect(full).toMatchObject({ through: 9, held: false, full: true });
-    const empty = await new EventConsumerService(fakePool(consumer(), () => [])).scanForStream('vox', 9, null);
+    const empty = await new EventConsumerService(fakePool(consumer(), () => [])).scanForStream('vox', 9, FULL_ACCESS);
     expect(empty).toEqual({ items: [], through: null, held: false, full: false });
   });
 
   test('a shared consumer is refused (leases are the pull path)', async () => {
     const service = new EventConsumerService(fakePool(consumer({ shared: true }), () => []));
     await expect(service.getStreamable('vox')).rejects.toThrow(/shared/);
-    await expect(service.scanForStream('vox', 0, null)).rejects.toThrow(/shared/);
+    await expect(service.scanForStream('vox', 0, FULL_ACCESS)).rejects.toThrow(/shared/);
   });
 
   test('never writes: the fake handle throws on insert/update/delete and the scan still succeeds', async () => {
     const service = new EventConsumerService(fakePool(consumer(), () => [row(8)]));
-    await expect(service.scanForStream('vox', 7, null)).resolves.toMatchObject({ through: 8 });
+    await expect(service.scanForStream('vox', 7, FULL_ACCESS)).resolves.toMatchObject({ through: 8 });
+  });
+});
+
+describe('stream lifetime cap (revocation ceiling)', () => {
+  test('EVENT_STREAM_MAX_LIFETIME_MS defaults to, and is clamped at, the 30 s termination ceiling', () => {
+    expect(STREAM_MAX_LIFETIME_CEILING_MS).toBe(30_000);
+    expect(resolveStreamMaxLifetimeMs(undefined)).toBe(30_000);
+    expect(resolveStreamMaxLifetimeMs('999999')).toBe(30_000);
+    expect(resolveStreamMaxLifetimeMs('0')).toBe(30_000);
+    expect(resolveStreamMaxLifetimeMs('5000')).toBe(5_000);
+  });
+
+  test('a stream ends itself within its lifetime with a reconnect event and releases everything', async () => {
+    const h = harness({ journal: [row(1)] });
+    const started = Date.now();
+    await h.run({ maxLifetimeMs: 40, heartbeatMs: 10, fallbackMs: 10 }); // resolves with no abort
+    expect(Date.now() - started).toBeLessThan(200);
+    expect(h.expired).toEqual(['lifetime']);
+    expect(h.unsubscribed()).toBe(true);
+    expect(liveConsumerStreamCount()).toBe(0);
+    const scans = h.scans.length;
+    await settle(40);
+    expect(h.scans.length).toBe(scans);
+  });
+
+  test('reconnecting with Last-Event-ID after a lifetime end resumes with no duplicates and no gaps', async () => {
+    const journal = [row(1), row(2), row(3)];
+    const match = (r: OmniEvent) => r.journalSeq % 2 === 1 || r.journalSeq > 4; // a sparse filter
+    const first = harness({ journal, match });
+    const appender = setInterval(() => journal.push(row(journal.length + 1)), 5);
+    await first.run({ maxLifetimeMs: 40, fallbackMs: 5 });
+    const lastEventId = first.sent[first.sent.length - 1]?.journalSeq ?? 0;
+
+    const second = harness({ journal, match });
+    const done = second.run({ start: lastEventId, fallbackMs: 5 });
+    await settle(40);
+    clearInterval(appender);
+    await settle(30);
+    second.abort();
+    await done;
+
+    const delivered = [...seqs(first.sent), ...seqs(second.sent)];
+    const expected = seqs(journal.filter(match));
+    expect(delivered).toEqual(expected);
+    expect(new Set(delivered).size).toBe(delivered.length);
+  });
+
+  test('shutdown ends every open stream with a reconnect event', async () => {
+    const a = harness({ journal: [] });
+    const b = harness({ journal: [] });
+    const runs = [a.run(), b.run()];
+    await settle(10);
+    expect(liveConsumerStreamCount()).toBe(2);
+    await closeAllConsumerStreams();
+    await Promise.all(runs);
+    expect(a.expired).toEqual(['shutdown']);
+    expect(b.expired).toEqual(['shutdown']);
+    expect(liveConsumerStreamCount()).toBe(0);
+  });
+});
+
+describe('per-process stream cap', () => {
+  test('slots are refused past the cap and freed on release (idempotently)', () => {
+    const one = acquireConsumerStreamSlot(2);
+    const two = acquireConsumerStreamSlot(2);
+    expect(one).not.toBeNull();
+    expect(two).not.toBeNull();
+    expect(acquireConsumerStreamSlot(2)).toBeNull();
+    one?.();
+    one?.();
+    const three = acquireConsumerStreamSlot(2);
+    expect(three).not.toBeNull();
+    expect(acquireConsumerStreamSlot(2)).toBeNull();
+    two?.();
+    three?.();
+  });
+
+  test('EVENT_STREAM_MAX_PER_PROCESS defaults to 100', () => {
+    expect(resolveStreamMaxPerProcess(undefined)).toBe(100);
+    expect(resolveStreamMaxPerProcess('abc')).toBe(100);
+    expect(resolveStreamMaxPerProcess('2.5')).toBe(100);
+    expect(resolveStreamMaxPerProcess('7')).toBe(7);
+  });
+});
+
+describe('wake debounce', () => {
+  test('a burst of wakes costs a bounded number of scans, not one per event', async () => {
+    const journal = [row(1)];
+    const h = harness({ journal });
+    const done = h.run({ minWakeGapMs: 25 });
+    await settle();
+    const before = h.scans.length;
+    for (let i = 0; i < 50; i++) h.wake();
+    await settle(60);
+    expect(h.scans.length - before).toBeLessThanOrEqual(3);
+    expect(h.scans.length - before).toBeGreaterThanOrEqual(1);
+    h.abort();
+    await done;
+  });
+});
+
+describe('instance restriction (B1)', () => {
+  const render = (clause: Parameters<PgDialect['sqlToQuery']>[0]) => new PgDialect().sqlToQuery(clause);
+
+  test('a full-access key adds no predicate; a restricted key adds instance_id IN (...); [] matches nothing', () => {
+    expect(streamInstanceClause(null)).toBeUndefined();
+    const restricted = streamInstanceClause(['inst-a', 'inst-b']);
+    if (!restricted) throw new Error('expected a clause');
+    const query = render(restricted);
+    expect(query.sql).toContain('"instance_id" in');
+    expect(query.params).toEqual(['inst-a', 'inst-b']);
+    const none = streamInstanceClause([]);
+    if (!none) throw new Error('expected a clause');
+    expect(render(none).sql).toBe('false');
+  });
+
+  test("the stream scan carries the key's instance predicate; a full key's scan does not", async () => {
+    const wheres: unknown[] = [];
+    const service = new EventConsumerService(fakePool(consumer(), () => [row(8)], wheres));
+    await service.scanForStream('vox', 7, { tenantId: null, instanceIds: ['inst-a'] });
+    await service.scanForStream('vox', 7, FULL_ACCESS);
+    const [restricted, full] = wheres.map((w) => render(w as Parameters<PgDialect['sqlToQuery']>[0]));
+    expect(restricted?.sql).toContain('"instance_id" in');
+    expect(restricted?.params).toContain('inst-a');
+    expect(full?.sql).not.toContain('instance_id');
   });
 });
