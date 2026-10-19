@@ -1,3 +1,4 @@
+import { createHash, randomUUID } from 'node:crypto';
 /**
  * WhatsApp Channel Plugin using Baileys
  *
@@ -22,7 +23,7 @@ import type {
   SendResult,
   StreamSender,
 } from '@omni/channel-sdk';
-import { resolveInstanceOwnerTenantId } from '@omni/core';
+import { ERROR_CODES, OmniError, resolveInstanceOwnerTenantId } from '@omni/core';
 import type { ChannelType, ContentType } from '@omni/core/types';
 import type {
   GroupMetadata,
@@ -36,7 +37,12 @@ import type {
 
 import { clearAuthState, createStorageAuthState } from './auth';
 import { WHATSAPP_CAPABILITIES } from './capabilities';
-import { getWhatsAppOutboundTimingConfig, getWhatsAppRateLimitConfig } from './env';
+import {
+  WHATSAPP_PRESENCE_HOLD_LIFETIME_CAP_MS,
+  getWhatsAppOutboundTimingConfig,
+  getWhatsAppPresenceHoldConfig,
+  getWhatsAppRateLimitConfig,
+} from './env';
 import { setupAllEventHandlers } from './handlers/all-events';
 import {
   cancelPendingReconnect,
@@ -44,7 +50,12 @@ import {
   seedAuthenticated,
   setupConnectionHandlers,
 } from './handlers/connection';
-import { extractQuotedContext, setupMessageHandlers, tryDownloadMedia } from './handlers/messages';
+import {
+  extractInboundReplyTo,
+  extractQuotedContext,
+  setupMessageHandlers,
+  tryDownloadMedia,
+} from './handlers/messages';
 import { fromJid, isGroupJid, isLidJid, isUserJid, toGroupJid, toJid } from './jid';
 import { buildMessageContent } from './senders/builders';
 import { computeWaid } from './senders/contact';
@@ -66,6 +77,21 @@ import { type RateLimitManager, createRateLimitManager, isRateLimitError } from 
 
 // Re-export for external consumers that previously imported from this module
 export type { FetchHistoryResult, HistorySyncMessage };
+
+export function selfPlatformMessageId(instanceId: string, owner: string, operationKey: string): string {
+  return `3EB0${createHash('sha256')
+    .update(JSON.stringify([instanceId, owner, operationKey]))
+    .digest('hex')
+    .slice(0, 32)
+    .toUpperCase()}`;
+}
+
+export function ownPhoneJid(value: unknown): string {
+  if (typeof value !== 'string' || !/^\d{5,20}(?::\d+)?@s\.whatsapp\.net$/.test(value)) {
+    throw new WhatsAppError(ErrorCode.NOT_CONNECTED, 'Verified own phone identity required');
+  }
+  return value.replace(/:\d+@/, '@');
+}
 
 export function isTransientConnectionClosedError(error: unknown): boolean {
   if (!error) return false;
@@ -271,6 +297,21 @@ function getOrCreate<K, V>(outer: Map<K, Map<string, V>>, key: K): Map<string, V
   return inner;
 }
 
+/**
+ * One server-held presence. The object itself is the hold's identity: an
+ * in-flight holdPresence call compares it against the registry entry to learn
+ * whether its hold is still the live one.
+ */
+type PresenceHold = {
+  /** Re-send timer; set only once the first presence frame went out. */
+  refresh?: ReturnType<typeof setInterval>;
+  lifetime: ReturnType<typeof setTimeout>;
+  /** The Baileys state this hold keeps showing. */
+  presence: 'composing' | 'recording';
+  /** Why the hold left the registry: 'replaced' by a newer hold on the chat, or 'ended' (paused/send/reaction/expiry/disconnect). */
+  endedBy: 'replaced' | 'ended' | null;
+};
+
 export class WhatsAppPlugin extends BaseChannelPlugin {
   readonly id: ChannelType = 'whatsapp-baileys';
   readonly name = 'WhatsApp (Baileys)';
@@ -279,6 +320,8 @@ export class WhatsAppPlugin extends BaseChannelPlugin {
 
   /** Active socket connections per instance */
   private sockets = new Map<string, WASocket>();
+  private selfGenerations = new WeakMap<WASocket, string>();
+  private selfConnectedAt = new WeakMap<WASocket, string>();
 
   /** Ephemeral passkey ceremonies requested by WhatsApp during pairing. */
   private passkeyStates = new Map<string, WhatsAppPasskeyState>();
@@ -321,6 +364,21 @@ export class WhatsAppPlugin extends BaseChannelPlugin {
 
   /** Last outgoing action timestamp per instance — for humanized delay */
   private lastActionTime = new Map<string, number>();
+
+  /**
+   * Server-held presences (opt-in, POST /messages/send/presence hold=true),
+   * keyed by `${instanceId}:${jid}` where jid is the resolveSendTarget
+   * (LID-first) target — the same JID sendMessage uses for that chat, so a
+   * send to the held chat finds and ends its hold.
+   */
+  private presenceHolds = new Map<string, PresenceHold>();
+
+  /**
+   * Pending legacy sendTyping auto-pause timers, keyed by
+   * `${instanceId}:${toJid(chatId)}`. Only read when a hold starts on that chat
+   * (a legacy pause firing later would otherwise kill the hold).
+   */
+  private legacyTypingPauses = new Map<string, Set<ReturnType<typeof setTimeout>>>();
 
   /**
    * Cache of message IDs sent by this bot (per instance).
@@ -491,6 +549,8 @@ export class WhatsAppPlugin extends BaseChannelPlugin {
 
   /** Per-instance LID-first enabled flag (DEC-8 rollback). Default: true. */
   private lidFirstEnabledMap = new Map<string, boolean>();
+  /** Instances that opted in to typed inbound reply context (connect option `inboundReplyContext`). */
+  private inboundReplyContextInstances = new Set<string>();
 
   /**
    * LID → phone JID mapping cache per instance.
@@ -586,6 +646,14 @@ export class WhatsAppPlugin extends BaseChannelPlugin {
    */
   isLidFirstEnabled(instanceId: string): boolean {
     return this.lidFirstEnabledMap.get(instanceId) ?? true;
+  }
+
+  /**
+   * Whether inbound events carry the typed `replyTo` (message.received) and
+   * `target` (reaction.received/removed). Off unless the instance opted in.
+   */
+  isInboundReplyContextEnabled(instanceId: string): boolean {
+    return this.inboundReplyContextInstances.has(instanceId);
   }
 
   /**
@@ -1006,6 +1074,13 @@ export class WhatsAppPlugin extends BaseChannelPlugin {
     // Store per-instance LID-first flag (DEC-8 rollback)
     this.lidFirstEnabledMap.set(instanceId, instanceOptions.lidFirstEnabled ?? true);
 
+    // Opt-in typed inbound reply context (instances.inbound_reply_context)
+    if (config.options?.inboundReplyContext === true) {
+      this.inboundReplyContextInstances.add(instanceId);
+    } else {
+      this.inboundReplyContextInstances.delete(instanceId);
+    }
+
     const socketOptions: Partial<SocketConfig> = {
       // Plugin-level defaults
       ...this.pluginConfig,
@@ -1145,10 +1220,14 @@ export class WhatsAppPlugin extends BaseChannelPlugin {
     this.rateLimitManagers.delete(instanceId);
     this.decryptTrackers.delete(instanceId);
     this.lidFirstEnabledMap.delete(instanceId);
+    this.inboundReplyContextInstances.delete(instanceId);
     this.lidMappingCache.delete(instanceId);
     this.publishedLidMappings.delete(instanceId);
     this.publishedContactNames.delete(instanceId);
     this.lastActionTime.delete(instanceId);
+    for (const key of [...this.presenceHolds.keys()]) {
+      if (key.startsWith(`${instanceId}:`)) this.clearPresenceHold(key);
+    }
     this.historyPushFetchCount.delete(instanceId);
     // Dispose and remove per-instance dedup cache
     this.dedupeCaches.get(instanceId)?.dispose();
@@ -1319,16 +1398,37 @@ export class WhatsAppPlugin extends BaseChannelPlugin {
       hasText: !!replyToText,
     });
 
-    // If we have the full rawPayload, use it directly (this is a WAMessage)
-    if (replyToRawPayload) return { quoted: replyToRawPayload };
+    // A stored inbound WAMessage is quoted as-is. Omni's own sent rows store
+    // {externalId, isFromMe, to} with no key/message, which Baileys cannot quote.
+    if (this.isQuotableRawPayload(replyToRawPayload)) return { quoted: replyToRawPayload };
 
-    // Fallback: construct quoted object with text content for preview
+    // Fallback: construct quoted object with text content for preview. The
+    // participant comes from the stored row's key when it carries one (a stored
+    // row always wins), else from the caller's replyToKey hint (no stored row).
+    const storedKey = replyToRawPayload?.key as Record<string, unknown> | undefined;
+    const hintedParticipant =
+      typeof message.metadata?.replyToParticipant === 'string' ? message.metadata.replyToParticipant : undefined;
+    const participant = typeof storedKey?.participant === 'string' ? storedKey.participant : hintedParticipant;
     return {
       quoted: {
-        key: { id: message.replyTo, remoteJid: jid, fromMe: replyToFromMe },
+        key: {
+          id: message.replyTo,
+          remoteJid: jid,
+          fromMe: replyToFromMe,
+          ...(participant !== undefined ? { participant } : {}),
+        },
         message: replyToText ? { conversation: replyToText } : {},
       },
     };
+  }
+
+  /** A raw payload Baileys can quote directly: an object `key` with an `id`, plus an object `message`. */
+  private isQuotableRawPayload(payload: Record<string, unknown> | undefined): boolean {
+    if (!payload) return false;
+    const { key, message } = payload;
+    if (typeof key !== 'object' || key === null) return false;
+    if (typeof (key as Record<string, unknown>).id !== 'string') return false;
+    return typeof message === 'object' && message !== null;
   }
 
   /**
@@ -1339,12 +1439,19 @@ export class WhatsAppPlugin extends BaseChannelPlugin {
     jid: string,
     message: OutgoingMessage,
   ): Promise<OutgoingMessage> {
-    await this.humanDelay(instanceId);
+    // Opt-in immediate pacing skips ONLY the humanized delay and the typing
+    // simulation; everything below still runs.
+    if (message.metadata?.outboundPacing !== 'immediate') {
+      await this.humanDelay(instanceId);
 
-    // Simulate typing for text/caption messages
-    const textContent = message.content.text || message.content.caption || '';
-    if (textContent.length > 0) {
-      await this.simulateTyping(instanceId, jid, textContent);
+      // Simulate typing for text/caption messages
+      const textContent = message.content.text || message.content.caption || '';
+      if (textContent.length > 0) {
+        await this.simulateTyping(instanceId, jid, textContent);
+      }
+    } else {
+      // Still the instance's latest action: a humanized send that follows is spaced by humanDelay.
+      this.lastActionTime.set(instanceId, Date.now());
     }
 
     // Handle audio conversion for voice notes (PTT)
@@ -1544,6 +1651,68 @@ export class WhatsAppPlugin extends BaseChannelPlugin {
     };
   }
 
+  /** Live authenticated identity only; persisted instance owner fields grant nothing. */
+  getSelfIdentity(instanceId: string): {
+    ownerIdentifier: string;
+    generation: string;
+    selfJid: string;
+    connectedAt: string;
+  } {
+    const sock = this.getSocket(instanceId);
+    if (this.instances.getStatus(instanceId)?.state !== 'connected') {
+      throw new WhatsAppError(ErrorCode.NOT_CONNECTED, 'WhatsApp is disconnected');
+    }
+    const ownerIdentifier = ownPhoneJid(sock.user?.id);
+    const generation = this.selfGenerations.get(sock);
+    const connectedAt = this.selfConnectedAt.get(sock);
+    if (!generation || !connectedAt) throw new Error('Authenticated connection epoch unavailable');
+    return { ownerIdentifier, generation, selfJid: ownerIdentifier, connectedAt };
+  }
+
+  /** This capability has no caller-selected recipient or generic-send fallback. */
+  async sendSelf(
+    instanceId: string,
+    input: { expectedOwner: string; expectedGeneration: string; operationKey: string; text: string },
+  ) {
+    if (
+      Object.keys(input).some(
+        (key) => !['expectedOwner', 'expectedGeneration', 'operationKey', 'text'].includes(key),
+      ) ||
+      !/^[A-Za-z0-9_-]{1,100}$/.test(input.operationKey) ||
+      typeof input.text !== 'string' ||
+      !input.text.trim() ||
+      input.text.length > 8000
+    )
+      throw new Error('Invalid self message');
+    const sock = this.getSocket(instanceId);
+    const admitted = this.getSelfIdentity(instanceId);
+    if (admitted.ownerIdentifier !== input.expectedOwner || admitted.generation !== input.expectedGeneration)
+      throw new Error('Self identity changed');
+    const externalId = selfPlatformMessageId(instanceId, admitted.ownerIdentifier, input.operationKey);
+    const limiter = await this.waitForRateLimitBackoff(instanceId);
+    const message: OutgoingMessage = {
+      to: admitted.selfJid,
+      content: { type: 'text', text: input.text },
+      metadata: { correlationId: input.operationKey },
+    };
+    // Pre-register the known durable operation's native ID before an early echo can arrive.
+    this.trackSentMessageId(instanceId, externalId);
+    const current = this.getSelfIdentity(instanceId);
+    if (
+      this.sockets.get(instanceId) !== sock ||
+      current.ownerIdentifier !== admitted.ownerIdentifier ||
+      current.generation !== admitted.generation
+    )
+      throw new Error('Self identity changed');
+    // No await between the synchronous identity fence and this platform invocation.
+    const result = await sock.sendMessage(admitted.selfJid, { text: input.text }, { messageId: externalId });
+    if (result?.key?.id !== externalId) throw new Error('Self send outcome is uncertain');
+    if (result.message) this.trackRecentSentMessage(instanceId, externalId, result.message);
+    await this.emitMessageSent(this.buildSentEventPayload(instanceId, externalId, admitted.selfJid, message, message));
+    limiter.reset();
+    return { externalId, ownerIdentifier: admitted.ownerIdentifier, generation: admitted.generation };
+  }
+
   async sendMessage(instanceId: string, message: OutgoingMessage): Promise<SendResult> {
     const sock = this.getSocket(instanceId);
     const jid = await this.resolveSendTarget(sock, instanceId, message.to);
@@ -1552,7 +1721,7 @@ export class WhatsAppPlugin extends BaseChannelPlugin {
     try {
       // ── Reaction dispatch (separate path — not a normal message) ──
       if (message.content.type === 'reaction') {
-        return this.dispatchReaction(instanceId, sock, jid, message);
+        return await this.dispatchReaction(instanceId, sock, jid, message);
       }
 
       const processedMessage = await this.preprocessOutgoing(instanceId, jid, message);
@@ -1571,6 +1740,9 @@ export class WhatsAppPlugin extends BaseChannelPlugin {
       if (jid.endsWith('@g.us')) {
         await this.prewarmGroupCaches(instanceId, sock, jid);
       }
+
+      // A server-held presence on this chat ends as the frame goes out.
+      await this.releasePresenceHoldForSend(instanceId, sock, jid);
 
       // Journey timing: T10 before platform call, T11 after
       const correlationId = message.metadata?.correlationId as string | undefined;
@@ -1602,6 +1774,9 @@ export class WhatsAppPlugin extends BaseChannelPlugin {
         timestamp: Date.now(),
       };
     } catch (error) {
+      // A failed send (preprocessing included) still ends a server-held presence on the chat.
+      await this.releasePresenceHoldForSend(instanceId, sock, jid);
+
       // ── Rate limit detection ──
       if (isRateLimitError(error)) {
         rateLimiter.handleRateLimit(error, 0);
@@ -1642,6 +1817,11 @@ export class WhatsAppPlugin extends BaseChannelPlugin {
     jid: string,
     message: OutgoingMessage,
   ): Promise<SendResult> {
+    // Any reaction attempt to the chat ends a server-held presence on it — a
+    // reaction rejected below included, so the hold never keeps refreshing.
+    // No-op when no hold is active.
+    await this.releasePresenceHoldForSend(instanceId, sock, jid);
+
     const { targetMessageId, emoji } = message.content;
 
     if (!targetMessageId) {
@@ -1672,8 +1852,13 @@ export class WhatsAppPlugin extends BaseChannelPlugin {
     const targetParticipant =
       typeof message.metadata?.targetParticipant === 'string' ? message.metadata.targetParticipant : undefined;
 
-    // Minimal delay for reactions (shorter than full humanDelay)
-    await this.humanDelay(instanceId);
+    // Minimal delay for reactions (shorter than full humanDelay); skipped under immediate pacing
+    if (message.metadata?.outboundPacing !== 'immediate') {
+      await this.humanDelay(instanceId);
+    } else {
+      // Still the instance's latest action: a humanized send that follows is spaced by humanDelay.
+      this.lastActionTime.set(instanceId, Date.now());
+    }
 
     this.logger.debug('Sending reaction', {
       jid,
@@ -1836,14 +2021,230 @@ export class WhatsAppPlugin extends BaseChannelPlugin {
     // Send composing presence
     await sock.sendPresenceUpdate('composing', jid);
 
-    // Auto-pause after duration
-    setTimeout(async () => {
+    // Auto-pause after duration. The timer is recorded per chat only so that a
+    // hold starting on this chat can cancel it (see holdPresence).
+    const pauseKey = `${instanceId}:${jid}`;
+    const pause = setTimeout(async () => {
+      this.forgetLegacyTypingPause(pauseKey, pause);
       try {
         await sock.sendPresenceUpdate('paused', jid);
       } catch {
         // Ignore errors when pausing typing
       }
     }, resolvedDuration);
+    const pending = this.legacyTypingPauses.get(pauseKey) ?? new Set<ReturnType<typeof setTimeout>>();
+    pending.add(pause);
+    this.legacyTypingPauses.set(pauseKey, pending);
+  }
+
+  private forgetLegacyTypingPause(key: string, timer: ReturnType<typeof setTimeout>): void {
+    const pending = this.legacyTypingPauses.get(key);
+    if (!pending) return;
+    pending.delete(timer);
+    if (pending.size === 0) this.legacyTypingPauses.delete(key);
+  }
+
+  /**
+   * Start, replace or stop a server-held presence (opt-in via
+   * POST /messages/send/presence hold=true).
+   *
+   * - 'typing' holds Baileys 'composing', 'recording' holds 'recording'; the
+   *   state is re-sent every WHATSAPP_PRESENCE_REFRESH_MS until a send or a
+   *   reaction to the chat, a 'paused' call, the max lifetime or an instance
+   *   disconnect. Reaching the max lifetime also sends 'paused' (best-effort).
+   * - 'paused' stops any hold on the chat and sends 'paused'.
+   * - maxLifetimeMs omitted or 0 = WHATSAPP_PRESENCE_MAX_LIFETIME_MS; any value
+   *   is capped at 300000.
+   * - At most WHATSAPP_PRESENCE_MAX_HOLDS_PER_INSTANCE chats per instance hold
+   *   at once; a hold on a new chat beyond that is CHANNEL_RATE_LIMITED.
+   *   Replacing the hold of an already held chat is always allowed.
+   *
+   * Concurrency: the hold is registered before its first frame is awaited, so
+   * the later of two calls on one chat wins and the earlier one never starts
+   * a refresh. A hold ended during that await (paused, send, reaction, expiry,
+   * disconnect) re-sends 'paused' so the chat ends paused whatever order the
+   * frames went out in, and reports expiresAt null.
+   *
+   * Target: the hold uses resolveSendTarget (LID-first), the same JID
+   * sendMessage resolves for the chat. Legacy sendTyping records its pending
+   * pause under toJid(chatId), so a hold start cancels that record.
+   */
+  async holdPresence(
+    instanceId: string,
+    chatId: string,
+    type: 'typing' | 'recording' | 'paused',
+    maxLifetimeMs?: number,
+  ): Promise<{ expiresAt: number | null; lifetimeMs: number }> {
+    const sock = this.getSocket(instanceId);
+    const jid = await this.resolveSendTarget(sock, instanceId, chatId);
+    const key = `${instanceId}:${jid}`;
+
+    if (type === 'paused') {
+      this.clearPresenceHold(key);
+      await sock.sendPresenceUpdate('paused', jid);
+      return { expiresAt: null, lifetimeMs: 0 };
+    }
+
+    const config = getWhatsAppPresenceHoldConfig();
+    this.assertPresenceHoldCapacity(instanceId, key, config.maxHoldsPerInstance);
+    this.clearPresenceHold(key, 'replaced');
+    this.cancelLegacyTypingPauses(`${instanceId}:${toJid(chatId)}`);
+    this.cancelLegacyTypingPauses(key);
+
+    const lifetimeMs = Math.min(
+      maxLifetimeMs && maxLifetimeMs > 0 ? maxLifetimeMs : config.maxLifetimeMs,
+      WHATSAPP_PRESENCE_HOLD_LIFETIME_CAP_MS,
+    );
+    const presence = type === 'recording' ? 'recording' : 'composing';
+    const hold = this.registerPresenceHold(instanceId, jid, key, lifetimeMs, presence);
+    const expiresAt = Date.now() + lifetimeMs;
+
+    try {
+      await sock.sendPresenceUpdate(presence, jid);
+    } catch (error) {
+      if (this.presenceHolds.get(key) === hold) this.clearPresenceHold(key);
+      throw error;
+    }
+
+    if (this.presenceHolds.get(key) !== hold) {
+      await this.settleSupersededPresenceHold(hold, key, sock, jid);
+      return { expiresAt: null, lifetimeMs: 0 };
+    }
+
+    hold.refresh = this.startPresenceRefresh(instanceId, key, hold, presence, jid, config.refreshMs);
+    return { expiresAt, lifetimeMs };
+  }
+
+  /** Refuse a hold on a NEW chat once the instance holds the configured maximum. */
+  private assertPresenceHoldCapacity(instanceId: string, key: string, maxHolds: number): void {
+    if (this.presenceHolds.has(key)) return;
+    const prefix = `${instanceId}:`;
+    let held = 0;
+    for (const heldKey of this.presenceHolds.keys()) {
+      if (heldKey.startsWith(prefix)) held++;
+    }
+    if (held < maxHolds) return;
+    throw new OmniError({
+      code: ERROR_CODES.CHANNEL_RATE_LIMITED,
+      message: `Instance ${instanceId} already holds presence in ${held} chats (WHATSAPP_PRESENCE_MAX_HOLDS_PER_INSTANCE=${maxHolds}); stop one with type 'paused' before holding another chat`,
+      context: { instanceId, maxHoldsPerInstance: maxHolds },
+      recoverable: true,
+    });
+  }
+
+  /**
+   * Put a fresh hold, with its lifetime timer, in the registry. When the
+   * lifetime runs out on the still-live hold, the hold ends and 'paused' is
+   * sent (best-effort) so the chat does not keep showing the indicator. A hold
+   * already replaced or ended has had its timer cleared, and the identity check
+   * keeps a stray fire from pausing a newer hold.
+   */
+  private registerPresenceHold(
+    instanceId: string,
+    jid: string,
+    key: string,
+    lifetimeMs: number,
+    presence: 'composing' | 'recording',
+  ): PresenceHold {
+    const hold: PresenceHold = {
+      presence,
+      lifetime: setTimeout(() => {
+        if (this.presenceHolds.get(key) !== hold) return;
+        this.clearPresenceHold(key);
+        this.sendExpiryPause(instanceId, jid);
+      }, lifetimeMs),
+      endedBy: null,
+    };
+    this.presenceHolds.set(key, hold);
+    return hold;
+  }
+
+  /** Best-effort 'paused' for an expired hold, on the socket current at fire time (a reconnect replaces it). */
+  private sendExpiryPause(instanceId: string, jid: string): void {
+    const current = this.sockets.get(instanceId);
+    if (!current) return;
+    try {
+      current.sendPresenceUpdate('paused', jid).catch(() => {
+        // Best-effort: the indicator also times out on the recipient side
+      });
+    } catch {
+      // Best-effort: a socket that throws synchronously must not escape the timer
+    }
+  }
+
+  /**
+   * A hold left the registry while its first frame was in flight, so that
+   * frame may have gone out after whatever superseded it. Re-assert the chat's
+   * current state (best-effort): the live hold's presence when a newer hold
+   * owns the chat, otherwise 'paused' (the stop's own 'paused' may have gone
+   * out before our frame).
+   */
+  private async settleSupersededPresenceHold(
+    hold: PresenceHold,
+    key: string,
+    sock: WASocket,
+    jid: string,
+  ): Promise<void> {
+    const live = this.presenceHolds.get(key);
+    if (!live && hold.endedBy === 'replaced') return;
+    try {
+      await sock.sendPresenceUpdate(live ? live.presence : 'paused', jid);
+    } catch {
+      // Best-effort: the chat's indicator also times out on the recipient side
+    }
+  }
+
+  private startPresenceRefresh(
+    instanceId: string,
+    key: string,
+    hold: PresenceHold,
+    presence: 'composing' | 'recording',
+    jid: string,
+    refreshMs: number,
+  ): ReturnType<typeof setInterval> {
+    const refresh = setInterval(() => {
+      if (this.presenceHolds.get(key) !== hold) {
+        clearInterval(refresh);
+        return;
+      }
+      // Look the socket up at fire time: a reconnect replaces it.
+      const current = this.sockets.get(instanceId);
+      if (!current) {
+        this.clearPresenceHold(key);
+        return;
+      }
+      current.sendPresenceUpdate(presence, jid).catch(() => {
+        // Best-effort refresh
+      });
+    }, refreshMs);
+    return refresh;
+  }
+
+  private cancelLegacyTypingPauses(key: string): void {
+    const pending = this.legacyTypingPauses.get(key);
+    if (!pending) return;
+    for (const timer of pending) clearTimeout(timer);
+    this.legacyTypingPauses.delete(key);
+  }
+
+  private clearPresenceHold(key: string, endedBy: 'replaced' | 'ended' = 'ended'): boolean {
+    const hold = this.presenceHolds.get(key);
+    if (!hold) return false;
+    hold.endedBy = endedBy;
+    if (hold.refresh) clearInterval(hold.refresh);
+    clearTimeout(hold.lifetime);
+    this.presenceHolds.delete(key);
+    return true;
+  }
+
+  /** End a hold on the send target and send 'paused' — only when a hold was active. */
+  private async releasePresenceHoldForSend(instanceId: string, sock: WASocket, jid: string): Promise<void> {
+    if (!this.clearPresenceHold(`${instanceId}:${jid}`)) return;
+    try {
+      await sock.sendPresenceUpdate('paused', jid);
+    } catch {
+      // Non-critical — the send itself clears the indicator on the recipient side
+    }
   }
 
   /**
@@ -2779,6 +3180,15 @@ export class WhatsAppPlugin extends BaseChannelPlugin {
    * @internal
    */
   async handleConnected(instanceId: string, sock: WASocket, isNewLogin = false): Promise<void> {
+    // This epoch belongs to the authenticated native event and exact socket,
+    // before profile/event persistence awaits or a later API observer.
+    try {
+      ownPhoneJid(sock.user?.id);
+      if (!this.selfConnectedAt.has(sock)) this.selfConnectedAt.set(sock, new Date().toISOString());
+      if (!this.selfGenerations.has(sock)) this.selfGenerations.set(sock, randomUUID());
+    } catch {
+      /* Unqualified self identity grants no capability; ordinary connection handling continues. */
+    }
     this.passkeyStates.delete(instanceId);
     // Get profile info
     let profileName: string | undefined;
@@ -3201,6 +3611,11 @@ export class WhatsAppPlugin extends BaseChannelPlugin {
     // Journey timing: capture T0 (platform) and T1 (plugin received)
     const timings = platformTimestamp ? this.captureInboundTimings(platformTimestamp, subStages) : undefined;
 
+    // Typed, additive quote of the replied-to message (opt-in; absent when not a reply)
+    const typedReplyTo = this.isInboundReplyContextEnabled(instanceId)
+      ? extractInboundReplyTo(this, instanceId, chatId, rawMessage)
+      : undefined;
+
     const correlationId = await this.emitMessageReceived({
       instanceId,
       externalId,
@@ -3215,6 +3630,7 @@ export class WhatsAppPlugin extends BaseChannelPlugin {
         mimeType: content.mimeType,
       },
       replyToId,
+      ...(typedReplyTo ? { replyTo: typedReplyTo } : {}),
       senderInstanceId: this.resolveSenderInstanceId(instanceId, from, isFromMe),
       rawPayload: extendedPayload,
       timings,
@@ -3238,6 +3654,7 @@ export class WhatsAppPlugin extends BaseChannelPlugin {
     emoji: string,
     targetMessageId: string,
     isFromMe: boolean,
+    target?: { fromMe: boolean; participant?: string },
   ): Promise<void> {
     // Note: We process fromMe reactions to capture reactions made from the phone
     // In WhatsApp, empty emoji string = reaction removed
@@ -3250,6 +3667,7 @@ export class WhatsAppPlugin extends BaseChannelPlugin {
         from,
         emoji,
         rawPayload: { externalId, isFromMe },
+        ...(target ? { target } : {}),
       });
     } else {
       await this.emitReactionRemoved({
@@ -3259,6 +3677,7 @@ export class WhatsAppPlugin extends BaseChannelPlugin {
         from,
         emoji: '', // WhatsApp doesn't tell us which emoji was removed
         rawPayload: { externalId, isFromMe },
+        ...(target ? { target } : {}),
       });
     }
   }
