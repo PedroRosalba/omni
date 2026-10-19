@@ -1826,6 +1826,9 @@ export const messages = pgTable(
  *
  * @see v1: message_traces (enhanced to full events)
  */
+/** Ingest-time access verdict journaled on omni_events.access_decision (opt-in). */
+export type EventAccessDecision = 'disabled' | 'allowed' | 'denied';
+
 export const omniEvents = pgTable(
   'omni_events',
   {
@@ -1910,6 +1913,15 @@ export const omniEvents = pgTable(
      * event that was never persisted or was pruned.
      */
     causationId: uuid('causation_id'),
+    /**
+     * Access verdict frozen at ingest: 'disabled' | 'allowed' | 'denied'.
+     * Written only when OMNI_JOURNAL_ACCESS_DECISION=true, and only for
+     * inbound (not-from-me) message.received / reaction.* rows. NULL for every
+     * other row and for every row journaled with the flag off — opt-in,
+     * additive, no backfill (0083). Durable consumers created with
+     * `access: 'allowed' | 'denied'` filter on it.
+     */
+    accessDecision: varchar('access_decision', { length: 10 }).$type<EventAccessDecision>(),
     /**
      * Monotonic journal position (#989, RFC #925 G7). Assigned by a sequence
      * at insert; the durable-consumer cursor is "last acked journal_seq" and
@@ -3440,6 +3452,9 @@ export interface SharedLeaseState {
   leases: ConsumerLease[];
 }
 
+/** Which journal rows a durable consumer sees by their ingest access verdict. */
+export type ConsumerAccessFilter = 'all' | 'allowed' | 'denied';
+
 export const durableConsumers = pgTable(
   'durable_consumers',
   {
@@ -3484,6 +3499,11 @@ export const durableConsumers = pgTable(
     instanceIds: jsonb('instance_ids').$type<string[]>(),
     /** Scoped consumers only: the api_keys.id that registered it. Null when unscoped. No FK (see 0082). */
     ownerKeyId: uuid('owner_key_id'),
+    /**
+     * Access filter over omni_events.access_decision (0083): 'all' (default,
+     * no predicate — every existing consumer) | 'allowed' | 'denied'.
+     */
+    accessFilter: varchar('access_filter', { length: 10 }).notNull().default('all').$type<ConsumerAccessFilter>(),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },

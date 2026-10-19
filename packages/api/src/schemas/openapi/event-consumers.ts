@@ -26,6 +26,9 @@ export const ConsumerConditionSchema = z.object({
   value: z.unknown().optional().openapi({ description: "Comparison value. Ignored for 'exists'/'not_exists'" }),
 });
 
+/** Access filter values: 'all' = no predicate; 'allowed'/'denied' match omni_events.access_decision. */
+const CONSUMER_ACCESS_FILTERS = ['all', 'allowed', 'denied'] as const;
+
 export const DurableConsumerSchema = z.object({
   id: z.string().uuid().openapi({ description: 'Consumer UUID' }),
   name: z.string().openapi({ description: 'Unique consumer name (the follow/ack handle)' }),
@@ -38,6 +41,11 @@ export const DurableConsumerSchema = z.object({
   cursor: z.number().int().openapi({ description: 'Last acked journal_seq; delivery resumes strictly after it' }),
   shared: z.boolean().openapi({
     description: 'true = competing consumers (pullers on this name split the stream); false = own cursor (fan-out)',
+  }),
+  accessFilter: z.enum(CONSUMER_ACCESS_FILTERS).openapi({
+    description:
+      "Access filter over the ingest access verdict: 'all' (default, every row) or only rows whose " +
+      "access_decision is 'allowed' / 'denied'",
   }),
   waitForReady: z.boolean().openapi({
     description:
@@ -101,6 +109,18 @@ export const CreateConsumerSchema = z.object({
         'Competing consumers (#1188). false (default) = fan-out: every consumer name has its own cursor and sees every ' +
         'event. true = N pullers on THIS name split the stream: each pull leases a page to one puller, ack(leaseId) ' +
         'releases it, an unacked lease is redelivered after leaseMs (at-least-once).',
+    }),
+  access: z
+    .enum(CONSUMER_ACCESS_FILTERS)
+    .optional()
+    .default('all')
+    .openapi({
+      description:
+        "Opt-in access filter. 'all' (default) = every row, unchanged. 'allowed' / 'denied' = only rows whose " +
+        'ingest access verdict (omni_events.access_decision) equals it. The verdict is frozen at ingest; call the ' +
+        'access check route for the current one. Requires OMNI_JOURNAL_ACCESS_DECISION=true (else 400). ' +
+        'Without waitForReady a row whose fill lands late (verdict still unset) can be skipped; set waitForReady ' +
+        'to hold the page until it lands.',
     }),
   waitForReady: z
     .boolean()

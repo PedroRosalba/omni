@@ -98,8 +98,9 @@ describe('consumer routes forward the caller (no new option: identical behaviour
       expect(statuses).toEqual([200, 201, 200, 200, 200, 200]);
 
       expect(service.list).toHaveBeenCalledWith(expected);
-      // The create body is passed through untouched: no scoped/instanceIds appear unless the client sent them.
-      expect(service.create).toHaveBeenCalledWith({ name: 'legacy', eventType: 'custom.*' }, expected);
+      // The create body is passed through untouched: no scoped/instanceIds appear unless the client sent them
+      // (`access: 'all'` is #1299's schema default, the unfiltered behaviour).
+      expect(service.create).toHaveBeenCalledWith({ name: 'legacy', eventType: 'custom.*', access: 'all' }, expected);
       expect(service.inspect).toHaveBeenCalledWith('legacy', expected);
       expect(service.pull).toHaveBeenCalledWith(
         'legacy',
