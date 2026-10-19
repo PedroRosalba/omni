@@ -12,6 +12,9 @@
  *    are honored, and the scanned cursor advances past filtered-out rows;
  *  - `startFrom: 'now'` skips history, `'beginning'` replays it;
  *  - lag = journal head minus cursor;
+ *  - opt-in instance scoping (0080): a scoped consumer pages only its
+ *    instances' rows (cursor still moves past the others) and is invisible
+ *    (404) to non-owner restricted keys; unscoped consumers stay global;
  *  - two-tenant containment: under RLS enforcement a tenant-scoped pull only
  *    ever pages its own tenant's journal rows (automation-actions two-tenant
  *    suite precedent).
@@ -33,11 +36,12 @@ import {
   applyTenantRlsEnforcement,
   createDbHandle,
   durableConsumers,
+  instances,
   omniEvents,
 } from '@omni/db';
 import { driverRejection, provisionMigratedDatabase } from '@omni/db/pg-migrated-template';
 import { setupEventPersistence } from '../plugins/event-persistence';
-import { EventConsumerService } from '../services/event-consumers';
+import { type ConsumerCaller, EventConsumerService } from '../services/event-consumers';
 import { runInWorkerTenantScope } from '../tenancy/worker-tenant-context';
 
 const superUrl = process.env.OMNI_G3_POSTGRES_URL ?? '';
@@ -396,6 +400,140 @@ postgresDescribe('durable event consumers (#989, real PostgreSQL)', () => {
       for (const item of items) {
         expect(item.lag).toBe(Math.max(0, item.head - item.cursor));
       }
+    });
+  });
+
+  describe('opt-in instance scoping + ownership (0080)', () => {
+    // Own instances (omni_events.instance_id is an FK): seeded on the superuser
+    // handle BEFORE the two-tenant block below turns on RLS enforcement.
+    let instA: string;
+    let instB: string;
+    let owner: ConsumerCaller;
+    let otherRestricted: ConsumerCaller;
+    const unrestricted: ConsumerCaller = { keyId: randomUUID(), instanceIds: null };
+    const rows = new Map<string, string>();
+    const idOf = (label: string): string => {
+      const id = rows.get(label);
+      if (!id) throw new Error(`no journal row labelled ${label}`);
+      return id;
+    };
+
+    /** Journal one row for an instance (or none) directly — the custom.> subscriber never sets instance_id. */
+    async function journalFor(label: string, instanceId: string | null): Promise<void> {
+      const [row] = await db
+        .insert(omniEvents)
+        .values({
+          channel: 'internal',
+          instanceId,
+          eventType: `custom.dc0080.${label}`,
+          direction: 'internal',
+          status: 'completed',
+          rawPayload: { label },
+        })
+        .returning({ id: omniEvents.id });
+      if (!row) throw new Error('journal insert returned nothing');
+      rows.set(label, row.id);
+    }
+
+    beforeAll(async () => {
+      const seeded = await db
+        .insert(instances)
+        .values([
+          { name: 'inst-a-0080', channel: 'whatsapp-baileys' as const },
+          { name: 'inst-b-0080', channel: 'whatsapp-baileys' as const },
+        ])
+        .returning({ id: instances.id, name: instances.name });
+      const a = seeded.find((i) => i.name === 'inst-a-0080')?.id;
+      const b = seeded.find((i) => i.name === 'inst-b-0080')?.id;
+      if (!a || !b) throw new Error('instance seed failed');
+      instA = a;
+      instB = b;
+      owner = { keyId: randomUUID(), instanceIds: [instA] };
+      otherRestricted = { keyId: randomUUID(), instanceIds: [instA] };
+
+      await service.create({ name: 'legacy-0080', eventType: 'custom.dc0080.*', startFrom: 'beginning' }, owner);
+      await service.create(
+        { name: 'scoped-0080', eventType: 'custom.dc0080.*', startFrom: 'beginning', scoped: true },
+        owner,
+      );
+      for (const [label, instance] of [
+        ['a1', instA],
+        ['b1', instB],
+        ['none', null],
+        ['b2', instB],
+        ['a2', instA],
+        ['b3', instB],
+      ] as const) {
+        await journalFor(label, instance);
+      }
+    });
+
+    test('no new option: identical behaviour — an unscoped consumer is global for every key', async () => {
+      const stored = await service.getByName('legacy-0080');
+      expect([stored.scoped, stored.instanceIds, stored.ownerKeyId]).toEqual([false, null, null]);
+      expect(published.find((p) => p.payload.name === 'legacy-0080')?.payload).not.toHaveProperty('scoped');
+
+      for (const caller of [owner, otherRestricted, unrestricted, undefined]) {
+        expect((await service.inspect('legacy-0080', caller)).name).toBe('legacy-0080');
+        expect((await service.list(caller)).map((c) => c.name)).toContain('legacy-0080');
+        // Every instance's rows (and instance-less rows) — the key's restriction does not apply.
+        const page = await service.pull('legacy-0080', { limit: 100 }, caller);
+        expect(page.items.map((e) => e.id)).toEqual(['a1', 'b1', 'none', 'b2', 'a2', 'b3'].map(idOf));
+      }
+      const page = await service.pull('legacy-0080', { limit: 2 }, otherRestricted);
+      expect((await service.ack('legacy-0080', page.cursor, undefined, otherRestricted)).cursor).toBe(page.cursor);
+      await service.delete('legacy-0080', otherRestricted);
+      await expect(service.inspect('legacy-0080')).rejects.toThrow(/not found/i);
+    });
+
+    test('scoped create stores the owner key and the restricted key instances', async () => {
+      const stored = await service.inspect('scoped-0080', owner);
+      expect(stored.scoped).toBe(true);
+      expect(stored.instanceIds).toEqual([instA]);
+      expect(stored.ownerKeyId).toBe(owner.keyId);
+    });
+
+    test("scoped pull pages only its instances' rows and the cursor moves past filtered rows", async () => {
+      const first = await service.pull('scoped-0080', { limit: 1 }, owner);
+      expect(first.items.map((e) => e.id)).toEqual([idOf('a1')]);
+      await service.ack('scoped-0080', first.cursor, undefined, owner);
+
+      // b1, none, b2 are skipped in SQL: the next 1-row page is a2.
+      const second = await service.pull('scoped-0080', { limit: 1 }, owner);
+      expect(second.items.map((e) => e.id)).toEqual([idOf('a2')]);
+      expect(second.items.every((e) => e.instanceId === instA)).toBe(true);
+      await service.ack('scoped-0080', second.cursor, undefined, owner);
+
+      // Only b3 (another instance) remains past the cursor: nothing to page, caught up despite lag.
+      const after = await service.pull('scoped-0080', { limit: 100 }, owner);
+      expect(after.items).toEqual([]);
+      expect(after.cursor).toBe(second.cursor);
+      const inspected = await service.inspect('scoped-0080', owner);
+      expect(inspected.caughtUp).toBe(true);
+      expect(inspected.lag).toBeGreaterThan(0);
+    });
+
+    test('a non-owner restricted key gets 404 on get/pull/ack/delete and does not see it listed', async () => {
+      await expect(service.inspect('scoped-0080', otherRestricted)).rejects.toThrow(/not found/i);
+      await expect(service.pull('scoped-0080', { limit: 10 }, otherRestricted)).rejects.toThrow(/not found/i);
+      const cursor = (await service.getByName('scoped-0080')).cursor;
+      await expect(service.ack('scoped-0080', cursor + 1000, undefined, otherRestricted)).rejects.toThrow(/not found/i);
+      await expect(service.delete('scoped-0080', otherRestricted)).rejects.toThrow(/not found/i);
+      expect((await service.list(otherRestricted)).map((c) => c.name)).not.toContain('scoped-0080');
+
+      // Nothing moved: the cursor is untouched and the consumer still exists.
+      expect((await service.getByName('scoped-0080')).cursor).toBe(cursor);
+    });
+
+    test('the owner and an instance-unrestricted key succeed', async () => {
+      for (const caller of [owner, unrestricted]) {
+        expect((await service.inspect('scoped-0080', caller)).ownerKeyId).toBe(owner.keyId);
+        expect((await service.list(caller)).map((c) => c.name)).toContain('scoped-0080');
+        const page = await service.pull('scoped-0080', { limit: 10 }, caller);
+        await service.ack('scoped-0080', page.cursor, undefined, caller);
+      }
+      await service.delete('scoped-0080', unrestricted);
+      await expect(service.inspect('scoped-0080', owner)).rejects.toThrow(/not found/i);
     });
   });
 

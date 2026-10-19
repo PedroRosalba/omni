@@ -39,6 +39,20 @@ export const DurableConsumerSchema = z.object({
   shared: z.boolean().openapi({
     description: 'true = competing consumers (pullers on this name split the stream); false = own cursor (fan-out)',
   }),
+  scoped: z.boolean().openapi({
+    description:
+      'true = instance-scoped consumer (opt-in): pulls only its instanceIds, visible only to its owner key and to ' +
+      'instance-unrestricted keys. false (default) = global consumer, unchanged behaviour',
+  }),
+  instanceIds: z
+    .array(z.string().uuid())
+    .nullable()
+    .openapi({ description: 'Scoped consumers: the instances whose journal rows it pages; null when unscoped' }),
+  ownerKeyId: z
+    .string()
+    .uuid()
+    .nullable()
+    .openapi({ description: 'Scoped consumers: id of the API key that registered it; null when unscoped' }),
   head: z.number().int().openapi({ description: 'Highest journal_seq currently in the journal' }),
   lag: z.number().int().openapi({ description: 'head - cursor (all journal rows past the cursor, not only matches)' }),
   caughtUp: z
@@ -82,6 +96,25 @@ export const CreateConsumerSchema = z.object({
         'Competing consumers (#1188). false (default) = fan-out: every consumer name has its own cursor and sees every ' +
         'event. true = N pullers on THIS name split the stream: each pull leases a page to one puller, ack(leaseId) ' +
         'releases it, an unacked lease is redelivered after leaseMs (at-least-once).',
+    }),
+  scoped: z
+    .boolean()
+    .optional()
+    .openapi({
+      description:
+        'Opt-in instance scoping. false (default) = global consumer, exactly the existing behaviour. true = the ' +
+        'consumer is owned by the calling API key and pulls only journal rows of its instanceIds; only the owner ' +
+        'key or an instance-unrestricted key can inspect, pull, ack, delete or list it (others get 404).',
+    }),
+  instanceIds: z
+    .array(z.string().uuid())
+    .max(100)
+    .optional()
+    .openapi({
+      description:
+        'Scoped consumers only (400 without scoped: true). Instance-restricted key: defaults to all of its ' +
+        'instances; naming an instance outside the key is 403; an empty result is 400. Instance-unrestricted key: ' +
+        'required and non-empty.',
     }),
 });
 
@@ -151,7 +184,9 @@ export function registerEventConsumerSchemas(registry: OpenAPIRegistry): void {
     operationId: 'listEventConsumers',
     tags: ['Events'],
     summary: 'List durable event consumers',
-    description: 'Every registered durable consumer with its filter, cursor, and live lag (journal head minus cursor).',
+    description:
+      'Every registered durable consumer with its filter, cursor, and live lag (journal head minus cursor). ' +
+      'Scoped consumers are listed only to their owner key and to instance-unrestricted keys.',
     responses: {
       200: {
         description: 'Registered consumers',
@@ -169,12 +204,21 @@ export function registerEventConsumerSchemas(registry: OpenAPIRegistry): void {
     description:
       'Registers a named consumer over the event journal: a type filter (trailing-* prefix glob, the events-wait ' +
       'contract) plus optional payload conditions (the automation-trigger matcher), and a stored cursor. ' +
-      "startFrom 'now' (default) begins at the journal head; 'beginning' replays the full journal (projections).",
+      "startFrom 'now' (default) begins at the journal head; 'beginning' replays the full journal (projections). " +
+      'Opt-in scoped: true binds the consumer to the calling key and an instance set (see instanceIds).',
     request: { body: { content: { 'application/json': { schema: CreateConsumerSchema } } } },
     responses: {
       201: {
         description: 'Consumer registered',
         content: { 'application/json': { schema: z.object({ data: DurableConsumerSchema }) } },
+      },
+      400: {
+        description: 'instanceIds without scoped: true, or a scoped consumer with no resolvable instances',
+        content: { 'application/json': { schema: ErrorSchema } },
+      },
+      403: {
+        description: 'Scoped consumer names an instance the API key cannot access',
+        content: { 'application/json': { schema: ErrorSchema } },
       },
       409: {
         description: 'A consumer with this name already exists',
@@ -196,7 +240,10 @@ export function registerEventConsumerSchemas(registry: OpenAPIRegistry): void {
         description: 'Consumer with live lag',
         content: { 'application/json': { schema: z.object({ data: DurableConsumerSchema }) } },
       },
-      404: { description: 'No such consumer', content: { 'application/json': { schema: ErrorSchema } } },
+      404: {
+        description: 'No such consumer (or a scoped consumer this key cannot access)',
+        content: { 'application/json': { schema: ErrorSchema } },
+      },
     },
   });
 
@@ -213,7 +260,10 @@ export function registerEventConsumerSchemas(registry: OpenAPIRegistry): void {
         description: 'Deleted',
         content: { 'application/json': { schema: z.object({ success: z.boolean() }) } },
       },
-      404: { description: 'No such consumer', content: { 'application/json': { schema: ErrorSchema } } },
+      404: {
+        description: 'No such consumer (or a scoped consumer this key cannot access)',
+        content: { 'application/json': { schema: ErrorSchema } },
+      },
     },
   });
 
@@ -233,7 +283,10 @@ export function registerEventConsumerSchemas(registry: OpenAPIRegistry): void {
     },
     responses: {
       200: { description: 'One page of events', content: { 'application/json': { schema: PullResultSchema } } },
-      404: { description: 'No such consumer', content: { 'application/json': { schema: ErrorSchema } } },
+      404: {
+        description: 'No such consumer (or a scoped consumer this key cannot access)',
+        content: { 'application/json': { schema: ErrorSchema } },
+      },
     },
   });
 
@@ -256,7 +309,10 @@ export function registerEventConsumerSchemas(registry: OpenAPIRegistry): void {
         content: { 'application/json': { schema: z.object({ data: DurableConsumerSchema }) } },
       },
       400: { description: 'Ack behind the stored cursor', content: { 'application/json': { schema: ErrorSchema } } },
-      404: { description: 'No such consumer', content: { 'application/json': { schema: ErrorSchema } } },
+      404: {
+        description: 'No such consumer (or a scoped consumer this key cannot access)',
+        content: { 'application/json': { schema: ErrorSchema } },
+      },
     },
   });
 }

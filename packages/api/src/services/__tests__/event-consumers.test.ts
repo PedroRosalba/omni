@@ -10,11 +10,14 @@
 import { describe, expect, test } from 'bun:test';
 import type { SharedLeaseState } from '@omni/db';
 import {
+  type ConsumerCaller,
+  canAccessConsumer,
   claimLease,
   computeLag,
   matchesConsumerPayload,
   planSharedPull,
   releaseLease,
+  resolveConsumerScope,
   resolveInitialCursor,
 } from '../event-consumers';
 
@@ -126,5 +129,110 @@ describe('shared consumer leases (#1188)', () => {
     expect(retry.rows).toEqual([1, 2, 3]);
     expect(releaseLease(retry.state, 'crashed')).toBeNull();
     expect(releaseLease(retry.state, 'retry')?.cursor).toBe(3);
+  });
+});
+
+describe('instance-scoped consumers (opt-in, 0080)', () => {
+  const INST_A = '11111111-1111-4111-8111-1111111111aa';
+  const INST_B = '11111111-1111-4111-8111-1111111111bb';
+  const INST_C = '11111111-1111-4111-8111-1111111111cc';
+  const KEY_RESTRICTED = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const KEY_ADMIN = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+  const restricted: ConsumerCaller = { keyId: KEY_RESTRICTED, instanceIds: [INST_A, INST_B] };
+  const otherRestricted: ConsumerCaller = { keyId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', instanceIds: [INST_A] };
+  const unrestricted: ConsumerCaller = { keyId: KEY_ADMIN, instanceIds: null };
+  const callers = { restricted, otherRestricted, unrestricted, keyless: { keyId: null, instanceIds: null } };
+
+  /** Run `fn` and return the thrown error's code (or 'ok'). */
+  function codeOf(fn: () => unknown): string {
+    try {
+      fn();
+      return 'ok';
+    } catch (error) {
+      return (error as { code?: string }).code ?? 'unknown';
+    }
+  }
+
+  test('no new option: identical behaviour — an unscoped create resolves to the legacy columns for every key', () => {
+    for (const caller of [...Object.values(callers), undefined]) {
+      expect(resolveConsumerScope({}, caller)).toEqual({ scoped: false, instanceIds: null, ownerKeyId: null });
+      expect(resolveConsumerScope({ scoped: false }, caller)).toEqual({
+        scoped: false,
+        instanceIds: null,
+        ownerKeyId: null,
+      });
+    }
+  });
+
+  test('no new option: identical behaviour — an unscoped consumer is accessible to every caller', () => {
+    const consumer = { scoped: false, ownerKeyId: null };
+    for (const caller of [...Object.values(callers), undefined]) {
+      expect(canAccessConsumer(consumer, caller)).toBe(true);
+    }
+  });
+
+  test('instanceIds without scoped: true is a 400 (never silently ignored)', () => {
+    expect(codeOf(() => resolveConsumerScope({ instanceIds: [INST_A] }, restricted))).toBe('VALIDATION');
+    expect(codeOf(() => resolveConsumerScope({ scoped: false, instanceIds: [INST_A] }, unrestricted))).toBe(
+      'VALIDATION',
+    );
+    expect(codeOf(() => resolveConsumerScope({ instanceIds: [] }, undefined))).toBe('VALIDATION');
+  });
+
+  test('restricted key: omitted instanceIds = all of the key instances; owner = calling key', () => {
+    expect(resolveConsumerScope({ scoped: true }, restricted)).toEqual({
+      scoped: true,
+      instanceIds: [INST_A, INST_B],
+      ownerKeyId: KEY_RESTRICTED,
+    });
+  });
+
+  test('restricted key: requested subset is kept (deduplicated)', () => {
+    expect(resolveConsumerScope({ scoped: true, instanceIds: [INST_B, INST_B] }, restricted)).toEqual({
+      scoped: true,
+      instanceIds: [INST_B],
+      ownerKeyId: KEY_RESTRICTED,
+    });
+  });
+
+  test('restricted key: an instance outside the key is 403, an empty intersection is 400', () => {
+    expect(codeOf(() => resolveConsumerScope({ scoped: true, instanceIds: [INST_A, INST_C] }, restricted))).toBe(
+      'FORBIDDEN',
+    );
+    expect(codeOf(() => resolveConsumerScope({ scoped: true, instanceIds: [] }, restricted))).toBe('VALIDATION');
+    expect(codeOf(() => resolveConsumerScope({ scoped: true }, { keyId: 'k', instanceIds: [] }))).toBe('VALIDATION');
+  });
+
+  test('unrestricted key: instanceIds is required and non-empty', () => {
+    expect(codeOf(() => resolveConsumerScope({ scoped: true }, unrestricted))).toBe('VALIDATION');
+    expect(codeOf(() => resolveConsumerScope({ scoped: true, instanceIds: [] }, unrestricted))).toBe('VALIDATION');
+    expect(resolveConsumerScope({ scoped: true, instanceIds: [INST_C] }, unrestricted)).toEqual({
+      scoped: true,
+      instanceIds: [INST_C],
+      ownerKeyId: KEY_ADMIN,
+    });
+  });
+
+  test('a scoped consumer needs a calling key (with a uuid id) to own it', () => {
+    expect(
+      codeOf(() =>
+        resolveConsumerScope({ scoped: true, instanceIds: [INST_A] }, { keyId: 'worker-x', instanceIds: null }),
+      ),
+    ).toBe('VALIDATION');
+    expect(codeOf(() => resolveConsumerScope({ scoped: true, instanceIds: [INST_A] }, callers.keyless))).toBe(
+      'VALIDATION',
+    );
+    expect(codeOf(() => resolveConsumerScope({ scoped: true, instanceIds: [INST_A] }, undefined))).toBe('VALIDATION');
+  });
+
+  test('a scoped consumer is visible to its owner and unrestricted keys only', () => {
+    const consumer = { scoped: true, ownerKeyId: KEY_RESTRICTED };
+    expect(canAccessConsumer(consumer, restricted)).toBe(true);
+    expect(canAccessConsumer(consumer, unrestricted)).toBe(true);
+    expect(canAccessConsumer(consumer, otherRestricted)).toBe(false);
+    expect(canAccessConsumer(consumer, { keyId: null, instanceIds: [INST_A] })).toBe(false);
+    // An orphaned scoped consumer (owner key gone) stays reachable by unrestricted keys only.
+    expect(canAccessConsumer({ scoped: true, ownerKeyId: null }, unrestricted)).toBe(true);
+    expect(canAccessConsumer({ scoped: true, ownerKeyId: null }, { keyId: null, instanceIds: [] })).toBe(false);
   });
 });

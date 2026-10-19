@@ -30,10 +30,18 @@
  * with limit 1 for per-message ack). Leases live on the consumer row and are
  * updated compare-and-set, so concurrent pullers on any replica never share
  * a page.
+ *
+ * Instance scoping (opt-in, 0080): a consumer created with `scoped: true`
+ * stores its owner key and an instance set. Its pull only pages journal rows
+ * of those instances (in SQL, inside the same scan, so the scanned cursor and
+ * the empty-page advance still move past filtered rows), and only the owner
+ * key or an instance-unrestricted key can see, pull, ack or delete it —
+ * anyone else gets the same 404 as a missing name. Unscoped consumers (the
+ * default) behave exactly as before for every key.
  */
 
 import { randomUUID } from 'node:crypto';
-import { ConflictError, NotFoundError, ValidationError, evaluateConditions } from '@omni/core';
+import { ConflictError, ERROR_CODES, NotFoundError, OmniError, ValidationError, evaluateConditions } from '@omni/core';
 import type { EventBus } from '@omni/core';
 import type {
   AutomationCondition,
@@ -44,7 +52,7 @@ import type {
   SharedLeaseState,
 } from '@omni/db';
 import { durableConsumers, omniEvents } from '@omni/db';
-import { type SQL, and, asc, eq, gt, isNull, lte, sql } from 'drizzle-orm';
+import { type SQL, and, asc, eq, gt, inArray, isNull, lte, or, sql } from 'drizzle-orm';
 import { scopedHandle } from '../tenancy/tenant-scope';
 import { eventTypeFilterClause } from './events';
 
@@ -61,7 +69,28 @@ export interface CreateConsumerInput {
   startFrom?: ConsumerStartFrom;
   /** Competing consumers: pullers on this name split the stream (#1188). Default false = fan-out. */
   shared?: boolean;
+  /** Opt-in instance scoping + ownership (0080). Default false = today's global consumer. */
+  scoped?: boolean;
+  /** Scoped consumers only: instance UUIDs to page. Rejected without `scoped: true`. */
+  instanceIds?: string[];
 }
+
+/**
+ * The calling API key as the consumer access rules see it. Routes derive it
+ * from the request's key; internal callers that pass none keep the legacy
+ * unrestricted behaviour.
+ */
+export interface ConsumerCaller {
+  /** api_keys.id of the caller; null when the request carried no key. */
+  keyId: string | null;
+  /** The key's instance restriction; null = every instance (ApiKeyService.instanceAllowed's rule). */
+  instanceIds: string[] | null;
+}
+
+/** The ownership columns a create writes: all null/false unless the consumer is scoped. */
+export type ConsumerScope =
+  | { scoped: false; instanceIds: null; ownerKeyId: null }
+  | { scoped: true; instanceIds: string[]; ownerKeyId: string };
 
 /** A consumer row plus its live lag (journal head minus cursor). */
 export interface ConsumerWithLag extends DurableConsumer {
@@ -151,6 +180,97 @@ export function matchesConsumerPayload(
   return evaluateConditions(filters, row.rawPayload ?? {});
 }
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** The caller's key id when it can own a consumer (owner_key_id is a uuid column), else null. */
+function ownerKeyOf(caller?: ConsumerCaller): string | null {
+  const keyId = caller?.keyId ?? null;
+  return keyId && UUID_RE.test(keyId) ? keyId : null;
+}
+
+/**
+ * Resolve the scope columns for a create. Unscoped (the default) is exactly
+ * the pre-0080 consumer; `instanceIds` without `scoped: true` is refused
+ * rather than silently ignored. Scoped: an instance-restricted key gets the
+ * requested instances (all of its own when omitted) and may not name an
+ * instance outside its set (403); an unrestricted key must name a non-empty
+ * set. An empty result is a 400. Exported for unit tests.
+ */
+export function resolveConsumerScope(
+  input: Pick<CreateConsumerInput, 'scoped' | 'instanceIds'>,
+  caller?: ConsumerCaller,
+): ConsumerScope {
+  if (!input.scoped) {
+    if (input.instanceIds !== undefined) {
+      throw new ValidationError('instanceIds is only valid with scoped: true', {
+        instanceIds: ['requires scoped: true'],
+      });
+    }
+    return { scoped: false, instanceIds: null, ownerKeyId: null };
+  }
+
+  const ownerKeyId = ownerKeyOf(caller);
+  if (!ownerKeyId) {
+    throw new ValidationError('a scoped consumer needs an API key to own it', { scoped: ['no calling API key'] });
+  }
+
+  const requested = input.instanceIds ? [...new Set(input.instanceIds)] : undefined;
+  const keyInstances = caller?.instanceIds ?? null;
+  if (keyInstances === null) {
+    if (!requested?.length) {
+      throw new ValidationError('a scoped consumer on an instance-unrestricted key needs a non-empty instanceIds', {
+        instanceIds: ['required (non-empty) for an unrestricted key'],
+      });
+    }
+    return { scoped: true, instanceIds: requested, ownerKeyId };
+  }
+
+  const outside = requested?.filter((id) => !keyInstances.includes(id)) ?? [];
+  if (outside.length > 0) {
+    throw new OmniError({
+      code: ERROR_CODES.FORBIDDEN,
+      message: 'API key does not have access to this instance',
+      context: { instanceIds: outside },
+      recoverable: false,
+    });
+  }
+  const instanceIds = requested ?? [...new Set(keyInstances)];
+  if (instanceIds.length === 0) {
+    throw new ValidationError('a scoped consumer needs at least one instance the API key can access', {
+      instanceIds: ['empty after intersecting with the API key instances'],
+    });
+  }
+  return { scoped: true, instanceIds, ownerKeyId };
+}
+
+/**
+ * Whether `caller` may see/pull/ack/delete `consumer`. Unscoped consumers and
+ * callers with no key context are unrestricted (legacy behaviour); a scoped
+ * consumer is visible to its owner key and to instance-unrestricted keys.
+ * Exported for unit tests.
+ */
+export function canAccessConsumer(
+  consumer: Pick<DurableConsumer, 'scoped' | 'ownerKeyId'>,
+  caller?: ConsumerCaller,
+): boolean {
+  if (!consumer.scoped || !caller || caller.instanceIds === null) return true;
+  return consumer.ownerKeyId !== null && consumer.ownerKeyId === caller.keyId;
+}
+
+/** SQL twin of canAccessConsumer for UPDATE/DELETE by name; undefined = no extra predicate. */
+function consumerAccessClause(caller?: ConsumerCaller): SQL | undefined {
+  if (!caller || caller.instanceIds === null) return undefined;
+  const unscoped = eq(durableConsumers.scoped, false);
+  const keyId = ownerKeyOf(caller);
+  return keyId ? or(unscoped, eq(durableConsumers.ownerKeyId, keyId)) : unscoped;
+}
+
+/** A scoped consumer pages only its instances' rows; an empty set fails closed. */
+function instanceScopeClause(consumer: Pick<DurableConsumer, 'scoped' | 'instanceIds'>): SQL | undefined {
+  if (!consumer.scoped) return undefined;
+  return consumer.instanceIds?.length ? inArray(omniEvents.instanceId, consumer.instanceIds) : sql`false`;
+}
+
 /** Initial cursor for a new consumer. Exported for unit tests. */
 export function resolveInitialCursor(startFrom: ConsumerStartFrom, head: number): number {
   return startFrom === 'beginning' ? 0 : head;
@@ -186,12 +306,14 @@ export class EventConsumerService {
     return Number(row?.head ?? 0);
   }
 
-  async list(): Promise<ConsumerWithLag[]> {
+  /** Every consumer the caller may see (all of them without a caller), with live lag. */
+  async list(caller?: ConsumerCaller): Promise<ConsumerWithLag[]> {
     const [rows, head] = await Promise.all([
       this.db.select().from(durableConsumers).orderBy(asc(durableConsumers.name)),
       this.head(),
     ]);
-    return Promise.all(rows.map((row) => this.withLag(row, head)));
+    const visible = rows.filter((row) => canAccessConsumer(row, caller));
+    return Promise.all(visible.map((row) => this.withLag(row, head)));
   }
 
   async getByName(name: string): Promise<DurableConsumer> {
@@ -200,9 +322,16 @@ export class EventConsumerService {
     return row;
   }
 
-  /** getByName plus live head/lag — the `inspect` surface. */
-  async inspect(name: string): Promise<ConsumerWithLag> {
+  /** getByName, but a scoped consumer the caller may not access is the same 404 as a missing one. */
+  private async getVisible(name: string, caller?: ConsumerCaller): Promise<DurableConsumer> {
     const row = await this.getByName(name);
+    if (!canAccessConsumer(row, caller)) throw new NotFoundError('DurableConsumer', name);
+    return row;
+  }
+
+  /** getByName plus live head/lag — the `inspect` surface. */
+  async inspect(name: string, caller?: ConsumerCaller): Promise<ConsumerWithLag> {
+    const row = await this.getVisible(name, caller);
     return this.withLag(row, await this.head());
   }
 
@@ -211,7 +340,8 @@ export class EventConsumerService {
     return { ...row, head, lag: computeLag(head, row.cursor), caughtUp };
   }
 
-  async create(input: CreateConsumerInput): Promise<ConsumerWithLag> {
+  async create(input: CreateConsumerInput, caller?: ConsumerCaller): Promise<ConsumerWithLag> {
+    const scope = resolveConsumerScope(input, caller);
     const head = await this.head();
     const cursor = resolveInitialCursor(input.startFrom ?? 'now', head);
 
@@ -225,6 +355,7 @@ export class EventConsumerService {
         cursor,
         shared: input.shared ?? false,
         leaseState: input.shared ? { claimed: cursor, leases: [] } : null,
+        ...(scope.scoped ? scope : {}),
       })
       .onConflictDoNothing({ target: durableConsumers.name })
       .returning();
@@ -245,14 +376,18 @@ export class EventConsumerService {
         eventType: created.eventType,
         cursor: created.cursor,
         shared: created.shared,
+        ...(created.scoped ? { scoped: true, instanceIds: created.instanceIds, ownerKeyId: created.ownerKeyId } : {}),
       });
     }
 
     return this.withLag(created, head);
   }
 
-  async delete(name: string): Promise<void> {
-    const [deleted] = await this.db.delete(durableConsumers).where(eq(durableConsumers.name, name)).returning();
+  async delete(name: string, caller?: ConsumerCaller): Promise<void> {
+    const [deleted] = await this.db
+      .delete(durableConsumers)
+      .where(and(eq(durableConsumers.name, name), consumerAccessClause(caller)))
+      .returning();
     if (!deleted) throw new NotFoundError('DurableConsumer', name);
 
     if (this.eventBus) {
@@ -275,10 +410,10 @@ export class EventConsumerService {
    * never acks an empty page (peek, or acking only delivered items) re-scans
    * the same window forever once non-matching rows exceed `limit`.
    */
-  async pull(name: string, options: PullOptions = {}): Promise<PullResult> {
+  async pull(name: string, options: PullOptions = {}, caller?: ConsumerCaller): Promise<PullResult> {
     const limit = Math.min(Math.max(options.limit ?? 100, 1), PULL_MAX_LIMIT);
     const waitMs = Math.min(Math.max(options.waitMs ?? 0, 0), PULL_MAX_WAIT_MS);
-    const consumer = await this.getByName(name);
+    const consumer = await this.getVisible(name, caller);
     if (consumer.shared) return this.pullShared(consumer, limit, waitMs, options.leaseMs ?? DEFAULT_LEASE_MS);
 
     const deadline = Date.now() + waitMs;
@@ -315,19 +450,27 @@ export class EventConsumerService {
    * idempotent no-op (client retry), an ack BEHIND it is refused with a 400 —
    * a durable cursor never moves backwards.
    */
-  async ack(name: string, cursor: number, leaseId?: string): Promise<ConsumerWithLag> {
-    if (leaseId) return this.ackShared(name, leaseId);
+  async ack(name: string, cursor: number, leaseId?: string, caller?: ConsumerCaller): Promise<ConsumerWithLag> {
+    if (leaseId) {
+      await this.getVisible(name, caller);
+      return this.ackShared(name, leaseId);
+    }
 
     const [updated] = await this.db
       .update(durableConsumers)
       .set({ cursor, updatedAt: new Date() })
       .where(
-        and(eq(durableConsumers.name, name), eq(durableConsumers.shared, false), lte(durableConsumers.cursor, cursor)),
+        and(
+          eq(durableConsumers.name, name),
+          eq(durableConsumers.shared, false),
+          lte(durableConsumers.cursor, cursor),
+          consumerAccessClause(caller),
+        ),
       )
       .returning();
 
     if (!updated) {
-      const existing = await this.getByName(name); // throws NotFoundError when absent
+      const existing = await this.getVisible(name, caller); // throws NotFoundError when absent or not visible
       if (existing.shared) {
         throw new ValidationError(`consumer '${name}' is shared — ack with the pull result's leaseId`, undefined, {
           name,
@@ -445,6 +588,9 @@ export class EventConsumerService {
    * One ascending journal page after the consumer's cursor, pre-filtered by
    * the type filter in SQL (exact match, or trailing-* prefix glob — the
    * EventService.list / #966 contract) minus the exclude globs (#1078).
+   * A scoped consumer (0080) also keeps only its instances' rows — in the
+   * same query, so the page's last row (the scanned cursor) is a row it may
+   * see, and the empty-page advance skips other instances' rows.
    */
   private async scanPage(
     consumer: DurableConsumer,
@@ -462,6 +608,7 @@ export class EventConsumerService {
           gt(omniEvents.journalSeq, after),
           through === undefined ? undefined : lte(omniEvents.journalSeq, through),
           typeClause,
+          instanceScopeClause(consumer),
         ),
       )
       .orderBy(asc(omniEvents.journalSeq))
