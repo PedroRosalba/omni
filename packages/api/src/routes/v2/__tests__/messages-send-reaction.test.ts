@@ -251,6 +251,17 @@ describe('POST /messages/send/reaction additive inputs (remove, targetKey)', () 
     const res = await postReactionBody(mountMessagesRoutes({ sendMessage }), { emoji: '' });
 
     expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: { issues: unknown[] } }).error.issues).toEqual([
+      {
+        code: 'too_small',
+        minimum: 1,
+        type: 'string',
+        inclusive: true,
+        exact: false,
+        message: 'String must contain at least 1 character(s)',
+        path: ['emoji'],
+      },
+    ]);
     expect(sendMessage).not.toHaveBeenCalled();
   });
 
@@ -259,6 +270,9 @@ describe('POST /messages/send/reaction additive inputs (remove, targetKey)', () 
     const res = await postReactionBody(mountMessagesRoutes({ sendMessage }), {});
 
     expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: { issues: unknown[] } }).error.issues).toEqual([
+      { code: 'invalid_type', expected: 'string', received: 'undefined', path: ['emoji'], message: 'Required' },
+    ]);
     expect(sendMessage).not.toHaveBeenCalled();
   });
 
