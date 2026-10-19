@@ -1708,7 +1708,7 @@ export class WhatsAppPlugin extends BaseChannelPlugin {
     try {
       // ── Reaction dispatch (separate path — not a normal message) ──
       if (message.content.type === 'reaction') {
-        return this.dispatchReaction(instanceId, sock, jid, message);
+        return await this.dispatchReaction(instanceId, sock, jid, message);
       }
 
       const processedMessage = await this.preprocessOutgoing(instanceId, jid, message);

@@ -7,7 +7,7 @@ import type { OutgoingMessage } from '@omni/channel-sdk';
 import { WHATSAPP_CAPABILITIES } from '../capabilities';
 import { setupMessageHandlers } from '../handlers/messages';
 import { WhatsAppPlugin } from '../plugin';
-import { WhatsAppError } from '../utils/errors';
+import { ErrorCode, WhatsAppError } from '../utils/errors';
 
 describe('WhatsAppPlugin', () => {
   describe('metadata', () => {
@@ -338,6 +338,54 @@ describe('WhatsAppPlugin', () => {
           fromMe: false,
           participant: PARTICIPANT,
         });
+      });
+    });
+
+    it('resolves a rejecting reaction send to the structured failure result instead of throwing', async () => {
+      await withHumanDelayDisabled(async () => {
+        const plugin = new WhatsAppPlugin();
+        const sendMessage = mock(() => Promise.reject(new WhatsAppError(ErrorCode.SEND_FAILED, 'reaction rejected')));
+        const publish = mock(async (_type: string, _payload: unknown) => {});
+        const mockSocket = { sendMessage, user: { id: '5511999999999@s.whatsapp.net' } };
+        (plugin as any).sockets = new Map([[INSTANCE_ID, mockSocket]]);
+        (plugin as any).eventBus = { publish };
+        (plugin as any).logger = { info: mock(), debug: mock(), warn: mock(), error: mock() };
+
+        const pending = plugin.sendMessage(INSTANCE_ID, {
+          to: GROUP_JID,
+          content: { type: 'reaction', targetMessageId: MESSAGE_ID, emoji: '👍' },
+          metadata: { fromMe: false, targetParticipant: PARTICIPANT },
+        } as any);
+
+        await expect(pending).resolves.toMatchObject({
+          success: false,
+          error: 'reaction rejected',
+          errorCode: ErrorCode.SEND_FAILED,
+          retryable: false,
+        });
+        expect(sendMessage).toHaveBeenCalledTimes(1);
+        expect(publish.mock.calls.map((call) => call[0])).toContain('message.failed');
+      });
+    });
+
+    it('returns the normal success result for a successful reaction send', async () => {
+      await withHumanDelayDisabled(async () => {
+        const plugin = new WhatsAppPlugin();
+        const sendMessage = mock(() => Promise.resolve({ key: { id: 'REACTION-OK-ID' } }));
+        const mockSocket = { sendMessage, user: { id: '5511999999999@s.whatsapp.net' } };
+        (plugin as any).sockets = new Map([[INSTANCE_ID, mockSocket]]);
+        (plugin as any).logger = { info: mock(), debug: mock(), warn: mock(), error: mock() };
+
+        const result = await plugin.sendMessage(INSTANCE_ID, {
+          to: GROUP_JID,
+          content: { type: 'reaction', targetMessageId: MESSAGE_ID, emoji: '👍' },
+          metadata: { fromMe: false, targetParticipant: PARTICIPANT },
+        } as any);
+
+        expect(result.success).toBe(true);
+        expect(result.errorCode).toBeUndefined();
+        expect(typeof result.timestamp).toBe('number');
+        expect(sendMessage).toHaveBeenCalledTimes(1);
       });
     });
 
