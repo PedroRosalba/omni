@@ -120,6 +120,10 @@ export const InstanceSchema = z.object({
       "WhatsApp (Baileys) pairing identity: 'desktop' (macOS Desktop + group history) or 'web' (Ubuntu/Chrome)",
   }),
   syncFullHistory: z.boolean().openapi({ description: 'WhatsApp (Baileys): request full history on connect' }),
+  inboundReplyContext: z.boolean().openapi({
+    description:
+      'WhatsApp (Baileys): typed replyTo on message.received and target on reaction.received/removed (false = events unchanged)',
+  }),
   ownerIdentifier: z.string().nullable().openapi({ description: 'Owner identifier' }),
   agentId: z.string().uuid().nullable().optional().openapi({ description: 'Agent UUID (agents table)' }),
   agentProviderId: z
@@ -170,6 +174,10 @@ export const CreateInstanceSchema = z.object({
     .boolean()
     .default(false)
     .openapi({ description: 'WhatsApp (Baileys): request full message history on connect (default: false)' }),
+  inboundReplyContext: z.boolean().default(false).openapi({
+    description:
+      'WhatsApp (Baileys): add the typed replyTo to message.received and target to reaction.received/removed (default: false = events unchanged). Read at connect: restart the instance after changing it',
+  }),
   gupshupHandoffOptions: GupshupHandoffOptionsSchema.nullable()
     .optional()
     .openapi({

@@ -278,8 +278,9 @@ export interface MessageReceivedPayload {
   replyToId?: string;
   /**
    * Typed quote of the replied-to message (additive to `replyToId`; absent when
-   * the message is not a reply). `fromMe` is true only when the quoted sender is
-   * proven to be this instance's own account.
+   * the message is not a reply, and unless the instance opted in with
+   * `inboundReplyContext` — WhatsApp Baileys only). `fromMe` is true only when the
+   * quoted sender is proven to be this instance's own account.
    */
   replyTo?: {
     externalId: string;
@@ -709,7 +710,7 @@ export interface ReactionReceivedPayload {
   isCustomEmoji?: boolean;
   /** Raw platform payload for channel-specific data */
   rawPayload?: Record<string, unknown>;
-  /** The reacted-to message, relative to the receiving instance (additive) */
+  /** The reacted-to message, relative to the receiving instance (opt-in: instance `inboundReplyContext`) */
   target?: { fromMe: boolean; participant?: string };
 }
 
@@ -728,7 +729,7 @@ export interface ReactionRemovedPayload {
   isCustomEmoji?: boolean;
   /** Raw platform payload (carries the reaction's own external id where the platform has one) */
   rawPayload?: Record<string, unknown>;
-  /** The message the reaction was removed from, relative to the receiving instance (additive) */
+  /** The message the reaction was removed from, relative to the receiving instance (opt-in: `inboundReplyContext`) */
   target?: { fromMe: boolean; participant?: string };
 }
 

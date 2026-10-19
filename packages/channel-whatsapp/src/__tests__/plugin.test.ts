@@ -4,6 +4,7 @@
 
 import { describe, expect, it, mock } from 'bun:test';
 import { WHATSAPP_CAPABILITIES } from '../capabilities';
+import { setupMessageHandlers } from '../handlers/messages';
 import { WhatsAppPlugin } from '../plugin';
 import { WhatsAppError } from '../utils/errors';
 
@@ -446,13 +447,14 @@ describe('WhatsAppPlugin', () => {
     });
   });
 
-  describe('inbound quotes and reaction targets (additive)', () => {
+  describe('inbound quotes and reaction targets (opt-in inboundReplyContext)', () => {
     const INSTANCE_ID = 'inbound-instance';
     const CHAT = '5511888888888@s.whatsapp.net';
     const OTHER = '5511888888888@s.whatsapp.net';
 
-    function createPluginWithEventBus() {
+    function createPluginWithEventBus({ inboundReplyContext = true }: { inboundReplyContext?: boolean } = {}) {
       const plugin = new WhatsAppPlugin();
+      if (inboundReplyContext) (plugin as any).inboundReplyContextInstances.add(INSTANCE_ID);
       const publish = mock(async (_type: string, _payload: unknown) => {});
       (plugin as any).sockets = new Map([[INSTANCE_ID, { user: { id: '5511999999999:3@s.whatsapp.net' } }]]);
       (plugin as any).eventBus = { publish };
@@ -466,18 +468,17 @@ describe('WhatsAppPlugin', () => {
       return call?.[1] as Record<string, unknown>;
     }
 
-    it('no new input: an inbound text reply still yields today replyToId and rawPayload.quotedMessage', async () => {
-      const { plugin, publish } = createPluginWithEventBus();
-      const msg = {
-        key: { id: 'REPLY-1', remoteJid: CHAT, fromMe: false },
-        message: {
-          extendedTextMessage: {
-            text: 'reply',
-            contextInfo: { stanzaId: 'QUOTED-1', participant: OTHER, quotedMessage: { conversation: 'original' } },
-          },
+    const QUOTED_REPLY = {
+      key: { id: 'REPLY-1', remoteJid: CHAT, fromMe: false },
+      message: {
+        extendedTextMessage: {
+          text: 'reply',
+          contextInfo: { stanzaId: 'QUOTED-1', participant: OTHER, quotedMessage: { conversation: 'original' } },
         },
-      };
+      },
+    };
 
+    async function receiveQuotedReply(plugin: WhatsAppPlugin) {
       await plugin.handleMessageReceived(
         INSTANCE_ID,
         'REPLY-1',
@@ -485,11 +486,12 @@ describe('WhatsAppPlugin', () => {
         '5511888888888',
         { type: 'text', text: 'reply' },
         'QUOTED-1',
-        msg as any,
+        QUOTED_REPLY as any,
         false,
       );
+    }
 
-      const payload = published(publish, 'message.received');
+    function expectTodayQuoteFields(payload: Record<string, unknown>) {
       expect(payload.replyToId).toBe('QUOTED-1');
       expect((payload.rawPayload as Record<string, unknown>).quotedMessage).toEqual({
         stanzaId: 'QUOTED-1',
@@ -498,6 +500,25 @@ describe('WhatsAppPlugin', () => {
         conversation: 'original',
         pushName: undefined,
       });
+    }
+
+    it('flag off (default): an inbound reply has today replyToId and rawPayload.quotedMessage and no replyTo key', async () => {
+      const { plugin, publish } = createPluginWithEventBus({ inboundReplyContext: false });
+
+      await receiveQuotedReply(plugin);
+
+      const payload = published(publish, 'message.received');
+      expectTodayQuoteFields(payload);
+      expect('replyTo' in payload).toBe(false);
+    });
+
+    it('flag on: an inbound reply also carries the typed replyTo', async () => {
+      const { plugin, publish } = createPluginWithEventBus();
+
+      await receiveQuotedReply(plugin);
+
+      const payload = published(publish, 'message.received');
+      expectTodayQuoteFields(payload);
       expect(payload.replyTo).toEqual({
         externalId: 'QUOTED-1',
         chatId: CHAT,
@@ -505,6 +526,55 @@ describe('WhatsAppPlugin', () => {
         fromMe: false,
         type: 'text',
         text: 'original',
+      });
+    });
+
+    it('flag off: the payload equals the flag-on payload minus replyTo', async () => {
+      const off = createPluginWithEventBus({ inboundReplyContext: false });
+      const on = createPluginWithEventBus();
+      await receiveQuotedReply(off.plugin);
+      await receiveQuotedReply(on.plugin);
+
+      const { replyTo: _typed, ...onWithoutReplyTo } = published(on.publish, 'message.received');
+      const offPayload = published(off.publish, 'message.received');
+      expect(Object.keys(offPayload).sort()).toEqual(Object.keys(onWithoutReplyTo).sort());
+      expect(offPayload.replyToId).toBe(onWithoutReplyTo.replyToId);
+      expect(offPayload.rawPayload).toEqual(onWithoutReplyTo.rawPayload);
+    });
+
+    it('flag off: a reaction through the socket handler emits no target key', async () => {
+      const { plugin, publish } = createPluginWithEventBus({ inboundReplyContext: false });
+      const listeners = new Map<string, (arg: unknown) => Promise<void>>();
+      const sock = {
+        ev: { on: (event: string, listener: (arg: unknown) => Promise<void>) => listeners.set(event, listener) },
+        presenceSubscribe: mock(async () => {}),
+        user: { id: '5511999999999:3@s.whatsapp.net' },
+      };
+      setupMessageHandlers(sock as any, plugin, INSTANCE_ID);
+
+      await listeners.get('messages.reaction')?.([
+        {
+          key: { id: 'MSG-1', remoteJid: CHAT, fromMe: true },
+          reaction: { key: { id: 'R-1', remoteJid: CHAT, fromMe: false }, text: '👍' },
+        },
+      ]);
+      await listeners.get('messages.reaction')?.([
+        {
+          key: { id: 'MSG-1', remoteJid: CHAT, fromMe: true },
+          reaction: { key: { id: 'R-2', remoteJid: CHAT, fromMe: false }, text: '' },
+        },
+      ]);
+
+      const received = published(publish, 'reaction.received');
+      const removed = published(publish, 'reaction.removed');
+      expect('target' in received).toBe(false);
+      expect('target' in removed).toBe(false);
+      expect(received).toEqual({
+        messageId: 'MSG-1',
+        chatId: CHAT,
+        from: '5511888888888',
+        emoji: '👍',
+        rawPayload: { externalId: 'R-1', isFromMe: false },
       });
     });
 

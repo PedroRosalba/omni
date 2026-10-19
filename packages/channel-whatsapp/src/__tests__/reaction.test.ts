@@ -62,7 +62,7 @@ describe('Reaction Sender', () => {
   });
 });
 
-describe('inbound reaction target (additive)', () => {
+describe('inbound reaction target (opt-in inboundReplyContext)', () => {
   const INSTANCE_ID = 'reaction-instance';
   const GROUP = '120363424772797713@g.us';
   const DM = '5511888888888@s.whatsapp.net';
@@ -72,8 +72,9 @@ describe('inbound reaction target (additive)', () => {
 
   type Listener = (arg: unknown) => Promise<void>;
 
-  function setup() {
+  function setup({ inboundReplyContext = true }: { inboundReplyContext?: boolean } = {}) {
     const plugin = new WhatsAppPlugin();
+    if (inboundReplyContext) (plugin as any).inboundReplyContextInstances.add(INSTANCE_ID);
     const listeners = new Map<string, Listener>();
     const sock = {
       ev: { on: (event: string, listener: Listener) => listeners.set(event, listener) },
@@ -145,6 +146,18 @@ describe('inbound reaction target (additive)', () => {
       '⏳',
     );
     expect(targetOfCall()).toEqual({ fromMe: false });
+  });
+
+  it('flag off: no target is built for a group or a DM reaction', async () => {
+    const { emitReaction, handleReactionReceived, targetOfCall } = setup({ inboundReplyContext: false });
+    await emitReaction(
+      { id: 'MSG-1', remoteJid: GROUP, fromMe: true, participant: OWN_LID },
+      { id: 'R-1', remoteJid: GROUP, fromMe: false, participant: OTHER },
+    );
+    await emitReaction({ id: 'MSG-2', remoteJid: DM, fromMe: true }, { id: 'R-2', remoteJid: DM, fromMe: false }, '');
+    expect(handleReactionReceived).toHaveBeenCalledTimes(2);
+    expect(targetOfCall(0)).toBeUndefined();
+    expect(targetOfCall(1)).toBeUndefined();
   });
 
   it('keeps every existing handleReactionReceived argument unchanged', async () => {

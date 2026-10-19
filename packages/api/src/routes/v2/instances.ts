@@ -11,6 +11,7 @@ import { z } from 'zod';
 import { accessCache } from '../../cache/cache-keys';
 import { DEFAULT_TURN_SCOPES } from '../../constants/scopes';
 import { agentKeyName } from '../../lib/agent-key-name';
+import { applyInboundReplyContextOption } from '../../lib/inbound-reply-context';
 import { applyWhatsAppBusinessConnectionOptions } from '../../lib/whatsapp-business-connection';
 import { filterByInstanceAccess, requireInstanceAccess } from '../../middleware/auth';
 import { invalidateProviderCacheForInstance } from '../../plugins/agent-dispatcher';
@@ -276,6 +277,12 @@ const createInstanceSchema = z.object({
     .boolean()
     .default(false)
     .describe('WhatsApp (Baileys): request full message history on connect (default: false)'),
+  inboundReplyContext: z
+    .boolean()
+    .default(false)
+    .describe(
+      'WhatsApp (Baileys): add the typed replyTo to message.received and target to reaction.received/removed (default: false = events unchanged). Read at connect: restart the instance after changing it',
+    ),
   reactionAck: z
     .enum(['on', 'off'])
     .default('off')
@@ -393,6 +400,7 @@ const updateInstanceSchema = createInstanceSchema
     markOnlineOnConnect: z.boolean().optional(),
     historyIdentity: z.enum(['desktop', 'web']).optional(),
     syncFullHistory: z.boolean().optional(),
+    inboundReplyContext: z.boolean().optional(),
     groupHistorySize: z.number().int().min(0).max(200).optional(),
     reactionAck: z.enum(['on', 'off']).optional(),
     reactionAckEmoji: z.record(z.string()).nullable().optional(),
@@ -1162,6 +1170,7 @@ instancesRoutes.post('/', zValidator('json', createInstanceSchema), async (c) =>
     );
   }
 
+  applyInboundReplyContextOption(connectionOptions, instance);
   await triggerCreateConnection(channelRegistry, data.channel, instance.id, connectionOptions);
 
   return c.json({ data: sanitizeInstance(instance) }, 201);
@@ -1784,9 +1793,13 @@ function hydrateConnectionOptionsForInstance(
 /** Persisted Baileys socket settings; a connect body's `whatsapp` still overrides them. */
 function applyWhatsAppBaileysOptions(
   options: Record<string, unknown>,
-  instance: Pick<InstanceRecord, 'channel' | 'markOnlineOnConnect' | 'historyIdentity' | 'syncFullHistory'>,
+  instance: Pick<
+    InstanceRecord,
+    'channel' | 'markOnlineOnConnect' | 'historyIdentity' | 'syncFullHistory' | 'inboundReplyContext'
+  >,
 ): void {
   if (instance.channel !== 'whatsapp-baileys') return;
+  applyInboundReplyContextOption(options, instance);
   options.whatsapp = {
     historyIdentity: instance.historyIdentity,
     syncFullHistory: instance.syncFullHistory,

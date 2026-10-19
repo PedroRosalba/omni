@@ -514,6 +514,8 @@ export class WhatsAppPlugin extends BaseChannelPlugin {
 
   /** Per-instance LID-first enabled flag (DEC-8 rollback). Default: true. */
   private lidFirstEnabledMap = new Map<string, boolean>();
+  /** Instances that opted in to typed inbound reply context (connect option `inboundReplyContext`). */
+  private inboundReplyContextInstances = new Set<string>();
 
   /**
    * LID → phone JID mapping cache per instance.
@@ -609,6 +611,14 @@ export class WhatsAppPlugin extends BaseChannelPlugin {
    */
   isLidFirstEnabled(instanceId: string): boolean {
     return this.lidFirstEnabledMap.get(instanceId) ?? true;
+  }
+
+  /**
+   * Whether inbound events carry the typed `replyTo` (message.received) and
+   * `target` (reaction.received/removed). Off unless the instance opted in.
+   */
+  isInboundReplyContextEnabled(instanceId: string): boolean {
+    return this.inboundReplyContextInstances.has(instanceId);
   }
 
   /**
@@ -1029,6 +1039,13 @@ export class WhatsAppPlugin extends BaseChannelPlugin {
     // Store per-instance LID-first flag (DEC-8 rollback)
     this.lidFirstEnabledMap.set(instanceId, instanceOptions.lidFirstEnabled ?? true);
 
+    // Opt-in typed inbound reply context (instances.inbound_reply_context)
+    if (config.options?.inboundReplyContext === true) {
+      this.inboundReplyContextInstances.add(instanceId);
+    } else {
+      this.inboundReplyContextInstances.delete(instanceId);
+    }
+
     const socketOptions: Partial<SocketConfig> = {
       // Plugin-level defaults
       ...this.pluginConfig,
@@ -1168,6 +1185,7 @@ export class WhatsAppPlugin extends BaseChannelPlugin {
     this.rateLimitManagers.delete(instanceId);
     this.decryptTrackers.delete(instanceId);
     this.lidFirstEnabledMap.delete(instanceId);
+    this.inboundReplyContextInstances.delete(instanceId);
     this.lidMappingCache.delete(instanceId);
     this.publishedLidMappings.delete(instanceId);
     this.publishedContactNames.delete(instanceId);
@@ -3303,8 +3321,10 @@ export class WhatsAppPlugin extends BaseChannelPlugin {
     // Journey timing: capture T0 (platform) and T1 (plugin received)
     const timings = platformTimestamp ? this.captureInboundTimings(platformTimestamp, subStages) : undefined;
 
-    // Typed, additive quote of the replied-to message (absent when not a reply)
-    const typedReplyTo = extractInboundReplyTo(this, instanceId, chatId, rawMessage);
+    // Typed, additive quote of the replied-to message (opt-in; absent when not a reply)
+    const typedReplyTo = this.isInboundReplyContextEnabled(instanceId)
+      ? extractInboundReplyTo(this, instanceId, chatId, rawMessage)
+      : undefined;
 
     const correlationId = await this.emitMessageReceived({
       instanceId,

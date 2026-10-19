@@ -1033,6 +1033,13 @@ export const instances = pgTable(
     /** Ask WhatsApp for full history on connect (default: false, see #70) */
     syncFullHistory: boolean('sync_full_history').notNull().default(false),
 
+    // ---- WhatsApp Inbound Reply Context (#1297) ----
+    /**
+     * Opt-in: WhatsApp (Baileys) adds the typed `replyTo` to message.received and
+     * `target` to reaction.received/removed. Off = events exactly as before. Read at connect.
+     */
+    inboundReplyContext: boolean('inbound_reply_context').notNull().default(false),
+
     // ---- Group History Context ----
     /** Number of recent messages to fetch for group context (0 = disabled, max 200) */
     groupHistorySize: integer('group_history_size').notNull().default(50),

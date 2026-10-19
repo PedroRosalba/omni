@@ -1027,11 +1027,13 @@ async function handleSpecialMessage(
       content.emoji || '',
       content.targetMessageId || '',
       isFromMe(msg),
-      buildReactionTarget(
-        plugin,
-        instanceId,
-        msg.message ? unwrapEnvelopes(msg.message).reactionMessage?.key : undefined,
-      ),
+      plugin.isInboundReplyContextEnabled(instanceId)
+        ? buildReactionTarget(
+            plugin,
+            instanceId,
+            msg.message ? unwrapEnvelopes(msg.message).reactionMessage?.key : undefined,
+          )
+        : undefined,
     );
     return true;
   }
@@ -1452,7 +1454,7 @@ export function setupMessageHandlers(
         reaction.text || '',
         messageId,
         reaction.key?.fromMe || false,
-        buildReactionTarget(plugin, instanceId, key),
+        plugin.isInboundReplyContextEnabled(instanceId) ? buildReactionTarget(plugin, instanceId, key) : undefined,
       );
     }
   });
