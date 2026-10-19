@@ -1398,24 +1398,37 @@ export class WhatsAppPlugin extends BaseChannelPlugin {
       hasText: !!replyToText,
     });
 
-    // If we have the full rawPayload, use it directly (this is a WAMessage)
-    if (replyToRawPayload) return { quoted: replyToRawPayload };
+    // A stored inbound WAMessage is quoted as-is. Omni's own sent rows store
+    // {externalId, isFromMe, to} with no key/message, which Baileys cannot quote.
+    if (this.isQuotableRawPayload(replyToRawPayload)) return { quoted: replyToRawPayload };
 
-    // Fallback: construct quoted object with text content for preview.
-    // replyToParticipant comes from the caller's replyToKey hint (no stored row).
-    const replyToParticipant =
+    // Fallback: construct quoted object with text content for preview. The
+    // participant comes from the stored row's key when it carries one (a stored
+    // row always wins), else from the caller's replyToKey hint (no stored row).
+    const storedKey = replyToRawPayload?.key as Record<string, unknown> | undefined;
+    const hintedParticipant =
       typeof message.metadata?.replyToParticipant === 'string' ? message.metadata.replyToParticipant : undefined;
+    const participant = typeof storedKey?.participant === 'string' ? storedKey.participant : hintedParticipant;
     return {
       quoted: {
         key: {
           id: message.replyTo,
           remoteJid: jid,
           fromMe: replyToFromMe,
-          ...(replyToParticipant ? { participant: replyToParticipant } : {}),
+          ...(participant !== undefined ? { participant } : {}),
         },
         message: replyToText ? { conversation: replyToText } : {},
       },
     };
+  }
+
+  /** A raw payload Baileys can quote directly: an object `key` with an `id`, plus an object `message`. */
+  private isQuotableRawPayload(payload: Record<string, unknown> | undefined): boolean {
+    if (!payload) return false;
+    const { key, message } = payload;
+    if (typeof key !== 'object' || key === null) return false;
+    if (typeof (key as Record<string, unknown>).id !== 'string') return false;
+    return typeof message === 'object' && message !== null;
   }
 
   /**
