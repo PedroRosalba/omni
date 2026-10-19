@@ -1902,7 +1902,7 @@ export const omniEvents = pgTable(
      * Written only when OMNI_JOURNAL_ACCESS_DECISION=true, and only for
      * inbound (not-from-me) message.received / reaction.* rows. NULL for every
      * other row and for every row journaled with the flag off — opt-in,
-     * additive, no backfill (0080). Durable consumers created with
+     * additive, no backfill (0081). Durable consumers created with
      * `access: 'allowed' | 'denied'` filter on it.
      */
     accessDecision: varchar('access_decision', { length: 10 }).$type<EventAccessDecision>(),
@@ -1915,6 +1915,14 @@ export const omniEvents = pgTable(
      * in physical order when the column landed (they predate every consumer).
      */
     journalSeq: bigserial('journal_seq', { mode: 'number' }),
+    /**
+     * False while an ingress claim's skeleton row awaits its persistence fill
+     * (the claim commits the row, and its journal_seq, before the payload
+     * lands). The fill sets it true. Default true: every other insert, and
+     * every row that predates the column, is complete. Read only by durable
+     * consumers created with wait_for_ready (opt-in journal readiness gate).
+     */
+    journalReady: boolean('journal_ready').notNull().default(true),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     /** G2 additive tenant ownership. Nullable through the additive phase. */
     tenantId: uuid('tenant_id').references((): AnyPgColumn => tenants.id, { onDelete: 'restrict' }),
@@ -3454,10 +3462,17 @@ export const durableConsumers = pgTable(
      * leased pages (`lease_state`), each page handed to one puller at a time.
      */
     shared: boolean('shared').notNull().default(false),
+    /**
+     * Opt-in journal readiness gate: when true, pull and shared claims stop
+     * each page just before the first claimed-but-unfilled row
+     * (omni_events.journal_ready = false) younger than the settle window, so
+     * the cursor never moves past it. Default false = today's behaviour.
+     */
+    waitForReady: boolean('wait_for_ready').notNull().default(false),
     /** Shared consumers only: claimed watermark + outstanding page leases. */
     leaseState: jsonb('lease_state').$type<SharedLeaseState>(),
     /**
-     * Access filter over omni_events.access_decision (0080): 'all' (default,
+     * Access filter over omni_events.access_decision (0081): 'all' (default,
      * no predicate — every existing consumer) | 'allowed' | 'denied'.
      */
     accessFilter: varchar('access_filter', { length: 10 }).notNull().default('all').$type<ConsumerAccessFilter>(),

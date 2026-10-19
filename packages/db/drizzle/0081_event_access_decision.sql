@@ -14,10 +14,20 @@
 --   durable_consumers.access_filter  varchar(10) NOT NULL DEFAULT 'all':
 --                                    'all' | 'allowed' | 'denied'
 --
--- Numbering collision: open PRs #1294 and #1295 also claim 0080. Per the
--- parallel-worktree rule, whichever PR merges later renumbers its OWN
--- migration to the next free number (file name, journal idx/tag, and a
--- `when` above the new previous entry); the one that landed is never touched.
+-- Numbering: first written as 0080, renumbered to 0081 when this PR (#1299)
+-- stacked on #1294, whose 0080_event_journal_ready merges first. Open PRs
+-- #1295 and #1298 are also ordered to merge before this one; when they land
+-- this migration renumbers again to the next free number (file name, journal
+-- idx/tag, and a `when` above the new previous entry), per the
+-- parallel-worktree rule. A migration that already landed is never touched.
+--
+-- Interaction with the #1294 readiness gate: a claimed-but-unfilled row has
+-- access_decision NULL until its fill lands. A consumer with BOTH
+-- wait_for_ready and an access filter widens the SQL predicate to
+-- (access_decision = filter OR journal_ready = false), so the gate can hold
+-- the page at that row; the access filter then runs on the surviving page.
+-- Without wait_for_ready the plain predicate can skip a row whose fill lands
+-- late; wait_for_ready is the fix.
 --
 -- Hand-written following the 0043/0044/0052 precedent (additive, idempotent).
 -- No explicit BEGIN/COMMIT — the boot migrator executes this file on a pooled

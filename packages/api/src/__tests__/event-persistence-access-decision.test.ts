@@ -1,5 +1,5 @@
 /**
- * Opt-in ingest access journal (0080) — DB-free.
+ * Opt-in ingest access journal (0081) — DB-free.
  *
  * With OMNI_JOURNAL_ACCESS_DECISION unset the message.received and
  * reaction.* fills must be exactly as before: no `accessDecision` key in the

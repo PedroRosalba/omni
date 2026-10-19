@@ -155,7 +155,7 @@ async function resolveChatUuidById(db: Database, candidate: unknown): Promise<st
 }
 
 /**
- * Opt-in ingest access journal (0080). Read at call time, never cached at
+ * Opt-in ingest access journal (0081). Read at call time, never cached at
  * module load: with the flag unset (the default) no access lookup runs and the
  * fill upserts carry no `accessDecision` key — byte-identical to before.
  */
@@ -276,6 +276,8 @@ export async function setupEventPersistence(eventBus: EventBus, db: Database): P
               agentId: metadata.agentId ?? null,
               causationId: metadata.causationId ?? null,
               conversationId: null,
+              // The fill completes a claimed skeleton row (opt-in consumer readiness gate).
+              journalReady: true,
               ...chatLink,
               ...accessColumns,
             };
@@ -350,6 +352,8 @@ export async function setupEventPersistence(eventBus: EventBus, db: Database): P
               agentId: metadata.agentId ?? null,
               causationId: metadata.causationId ?? null,
               conversationId: null,
+              // The fill completes a claimed skeleton row (opt-in consumer readiness gate).
+              journalReady: true,
               ...chatLink,
             };
 
@@ -610,6 +614,8 @@ export async function setupEventPersistence(eventBus: EventBus, db: Database): P
                 metadata: { correlationId: metadata.correlationId, from: payload.from, emoji: payload.emoji },
                 causationId: metadata.causationId ?? null,
                 conversationId: null,
+                // The fill completes a claimed skeleton row (opt-in consumer readiness gate).
+                journalReady: true,
                 ...chatLink,
                 ...accessColumns,
               };

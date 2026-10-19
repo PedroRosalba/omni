@@ -47,6 +47,11 @@ export const DurableConsumerSchema = z.object({
       "Access filter over the ingest access verdict: 'all' (default, every row) or only rows whose " +
       "access_decision is 'allowed' / 'denied'",
   }),
+  waitForReady: z.boolean().openapi({
+    description:
+      'true = opt-in journal readiness gate: claimed-but-unfilled rows are held (not delivered, cursor not moved ' +
+      "past them) until filled or older than the settle window; false = today's behaviour",
+  }),
   head: z.number().int().openapi({ description: 'Highest journal_seq currently in the journal' }),
   lag: z.number().int().openapi({ description: 'head - cursor (all journal rows past the cursor, not only matches)' }),
   caughtUp: z
@@ -100,6 +105,15 @@ export const CreateConsumerSchema = z.object({
         "Opt-in access filter. 'all' (default) = every row, unchanged. 'allowed' / 'denied' = only rows whose " +
         'ingest access verdict (omni_events.access_decision) equals it. The verdict is frozen at ingest; call the ' +
         'access check route for the current one. Requires OMNI_JOURNAL_ACCESS_DECISION=true (else 400).',
+    }),
+  waitForReady: z
+    .boolean()
+    .optional()
+    .openapi({
+      description:
+        "Opt-in journal readiness gate. false (default) = today's behaviour: a row claimed at ingress but not yet " +
+        'filled is delivered as it is. true = pull and shared claims stop before such a row (journalReady false) ' +
+        'until it is filled or older than the settle window (EVENT_CONSUMER_SETTLE_MS, default 5000 ms).',
     }),
 });
 

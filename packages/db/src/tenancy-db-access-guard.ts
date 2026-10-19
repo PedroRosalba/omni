@@ -979,7 +979,7 @@ export const REGISTERED_DB_ACCESS: readonly RegisteredDbAccess[] = [
     class: 'tenant-boundary',
   },
   {
-    // Opt-in ingest access journal (0080, OMNI_JOURNAL_ACCESS_DECISION=true
+    // Opt-in ingest access journal (0081, OMNI_JOURNAL_ACCESS_DECISION=true
     // only): the instance access-mode lookup for an inbound message/reaction
     // issues on `scopedHandle(db)` inside `runTenantWorkDb(db,
     // trustedEnvelopeTenant(event), ...)` — the same worker tenant scope as the
