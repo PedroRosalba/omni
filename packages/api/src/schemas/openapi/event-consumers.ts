@@ -140,7 +140,7 @@ export const CreateConsumerSchema = z.object({
         'consumer is owned by the calling API key and pulls only journal rows of its instanceIds; only the owner ' +
         'key or an instance-unrestricted key can inspect, pull, ack, delete or list it (others get 404).',
     }),
-  // Typed loosely on purpose: before 0080 an unknown `instanceIds` was stripped, so a legacy client that
+  // Typed loosely on purpose: before 0082 an unknown `instanceIds` was stripped, so a legacy client that
   // sends one (any shape) without `scoped: true` must keep being accepted and ignored. The service
   // validates it (array of up to 100 UUIDs) only for scoped consumers.
   instanceIds: z

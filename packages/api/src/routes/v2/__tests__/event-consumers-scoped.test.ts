@@ -1,5 +1,5 @@
 /**
- * Durable consumer routes — opt-in instance scoping (0080), DB-free.
+ * Durable consumer routes — opt-in instance scoping (0082), DB-free.
  *
  * Two halves:
  *  - every route hands the service the caller derived from the request's key

@@ -14,12 +14,10 @@
 --   durable_consumers.access_filter  varchar(10) NOT NULL DEFAULT 'all':
 --                                    'all' | 'allowed' | 'denied'
 --
--- Numbering: first written as 0080, renumbered to 0081 when this PR (#1299)
--- stacked on #1294, whose 0080_event_journal_ready merges first. Open PRs
--- #1295 and #1298 are also ordered to merge before this one; when they land
--- this migration renumbers again to the next free number (file name, journal
--- idx/tag, and a `when` above the new previous entry), per the
--- parallel-worktree rule. A migration that already landed is never touched.
+-- Numbering: first written as 0080, then 0081; renumbered to 0083 for the
+-- agreed merge order #1294 (0080), #1295 (0081), #1298 (0082), #1299 (this
+-- one, 0083), per the parallel-worktree rule (file name, journal idx/tag, and
+-- a `when` above the previous entry). A migration that landed is never touched.
 --
 -- Interaction with the #1294 readiness gate: a claimed-but-unfilled row has
 -- access_decision NULL until its fill lands. A consumer with BOTH

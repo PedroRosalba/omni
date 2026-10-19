@@ -1918,7 +1918,7 @@ export const omniEvents = pgTable(
      * Written only when OMNI_JOURNAL_ACCESS_DECISION=true, and only for
      * inbound (not-from-me) message.received / reaction.* rows. NULL for every
      * other row and for every row journaled with the flag off — opt-in,
-     * additive, no backfill (0081). Durable consumers created with
+     * additive, no backfill (0083). Durable consumers created with
      * `access: 'allowed' | 'denied'` filter on it.
      */
     accessDecision: varchar('access_decision', { length: 10 }).$type<EventAccessDecision>(),
@@ -3488,7 +3488,7 @@ export const durableConsumers = pgTable(
     /** Shared consumers only: claimed watermark + outstanding page leases. */
     leaseState: jsonb('lease_state').$type<SharedLeaseState>(),
     /**
-     * Opt-in instance scoping (0080). false (default) = today's global
+     * Opt-in instance scoping (0082). false (default) = today's global
      * consumer: every key with events:* may read and move it, and it pages
      * every instance's rows. true = pull only pages rows whose instance_id is
      * in `instance_ids`, and only the owner key (or an instance-unrestricted
@@ -3497,10 +3497,10 @@ export const durableConsumers = pgTable(
     scoped: boolean('scoped').notNull().default(false),
     /** Scoped consumers only: instance UUIDs this consumer may page. Null when unscoped. */
     instanceIds: jsonb('instance_ids').$type<string[]>(),
-    /** Scoped consumers only: the api_keys.id that registered it. Null when unscoped. No FK (see 0080). */
+    /** Scoped consumers only: the api_keys.id that registered it. Null when unscoped. No FK (see 0082). */
     ownerKeyId: uuid('owner_key_id'),
     /**
-     * Access filter over omni_events.access_decision (0081): 'all' (default,
+     * Access filter over omni_events.access_decision (0083): 'all' (default,
      * no predicate — every existing consumer) | 'allowed' | 'denied'.
      */
     accessFilter: varchar('access_filter', { length: 10 }).notNull().default('all').$type<ConsumerAccessFilter>(),

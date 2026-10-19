@@ -146,7 +146,7 @@ describe('shared consumer leases (#1188)', () => {
 });
 
 // ============================================================================
-// Opt-in access filter (0081): SQL predicate inside scanPage, gated create
+// Opt-in access filter (0083): SQL predicate inside scanPage, gated create
 // ============================================================================
 
 const ENV = 'OMNI_JOURNAL_ACCESS_DECISION';
@@ -243,7 +243,7 @@ describe('accessFilterClause', () => {
 
 describe('scanPage access predicate (via pull)', () => {
   function todaysWhere(): { sql: string; params: unknown[] } {
-    // The pre-0081 scanPage WHERE: journal_seq bound + type clause, nothing else.
+    // The pre-0083 scanPage WHERE: journal_seq bound + type clause, nothing else.
     return render(
       and(gt(omniEvents.journalSeq, 0), undefined, eventTypeFilterClause(['message.received'], undefined)) as SQL,
     );
@@ -391,7 +391,7 @@ describe('resolveConsumerSettleMs', () => {
   });
 });
 
-describe('instance-scoped consumers (opt-in, 0080)', () => {
+describe('instance-scoped consumers (opt-in, 0082)', () => {
   const INST_A = '11111111-1111-4111-8111-1111111111aa';
   const INST_B = '11111111-1111-4111-8111-1111111111bb';
   const INST_C = '11111111-1111-4111-8111-1111111111cc';

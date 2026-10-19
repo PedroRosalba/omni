@@ -31,7 +31,7 @@
  * updated compare-and-set, so concurrent pullers on any replica never share
  * a page.
  *
- * Instance scoping (opt-in, 0080): a consumer created with `scoped: true`
+ * Instance scoping (opt-in, 0082): a consumer created with `scoped: true`
  * stores its owner key and an instance set. Its pull only pages journal rows
  * of those instances (in SQL, inside the same scan, so the scanned cursor and
  * the empty-page advance still move past filtered rows), and only the owner
@@ -86,11 +86,11 @@ export interface CreateConsumerInput {
    * than the settle window) instead of delivering them hollow. Default false.
    */
   waitForReady?: boolean;
-  /** Opt-in instance scoping + ownership (0080). Default false = today's global consumer. */
+  /** Opt-in instance scoping + ownership (0082). Default false = today's global consumer. */
   scoped?: boolean;
   /**
    * Scoped consumers only: instance UUIDs to page (validated there). Ignored
-   * without `scoped: true`, as an unknown field was before 0080.
+   * without `scoped: true`, as an unknown field was before 0082.
    */
   instanceIds?: unknown;
 }
@@ -279,7 +279,7 @@ const ScopedInstanceIdsSchema = z.array(z.string().uuid()).max(100).optional();
 
 /**
  * Resolve the scope columns for a create. Unscoped (the default) is exactly
- * the pre-0080 consumer, and any `instanceIds` sent with it is ignored as it
+ * the pre-0082 consumer, and any `instanceIds` sent with it is ignored as it
  * was before (an unknown field). Scoped: the instanceIds must be up to 100
  * UUIDs (400 otherwise); an instance-restricted key gets the
  * requested instances (all of its own when omitted) and may not name an
@@ -373,7 +373,7 @@ function instanceScopeClause(consumer: Pick<DurableConsumer, 'scoped' | 'instanc
   return consumer.instanceIds?.length ? inArray(omniEvents.instanceId, consumer.instanceIds) : sql`false`;
 }
 
-/** Env flag that makes event persistence journal the access verdict (0081). */
+/** Env flag that makes event persistence journal the access verdict (0083). */
 const ACCESS_DECISION_ENV = 'OMNI_JOURNAL_ACCESS_DECISION';
 
 /**
@@ -832,10 +832,10 @@ export class EventConsumerService {
    * One ascending journal page after the consumer's cursor, pre-filtered by
    * the type filter in SQL (exact match, or trailing-* prefix glob — the
    * EventService.list / #966 contract) minus the exclude globs (#1078).
-   * A scoped consumer (0080) also keeps only its instances' rows — in the
+   * A scoped consumer (0082) also keeps only its instances' rows — in the
    * same query, so the page's last row (the scanned cursor) is a row it may
    * see, and the empty-page advance skips other instances' rows. Only for an
-   * access-filtered consumer, the ingest access verdict (0081) is applied too.
+   * access-filtered consumer, the ingest access verdict (0083) is applied too.
    * Every caller (fresh lease, reclaim, pull, withLag's caughtUp) inherits it.
    * With `waitForReady` the access predicate also admits not-ready rows (see
    * `accessFilterClause`), so a pending claim keeps caughtUp false and the

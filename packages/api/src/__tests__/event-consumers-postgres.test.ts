@@ -12,7 +12,7 @@
  *    are honored, and the scanned cursor advances past filtered-out rows;
  *  - `startFrom: 'now'` skips history, `'beginning'` replays it;
  *  - lag = journal head minus cursor;
- *  - opt-in instance scoping (0080): a scoped consumer pages only its
+ *  - opt-in instance scoping (0082): a scoped consumer pages only its
  *    instances' rows (cursor still moves past the others) and is invisible
  *    (404) to non-owner restricted keys; unscoped consumers stay global;
  *  - two-tenant containment: under RLS enforcement a tenant-scoped pull only
@@ -801,7 +801,7 @@ postgresDescribe('durable event consumers (#989, real PostgreSQL)', () => {
     });
   });
 
-  describe('opt-in instance scoping + ownership (0080)', () => {
+  describe('opt-in instance scoping + ownership (0082)', () => {
     // Own instances (omni_events.instance_id is an FK): seeded on the superuser
     // handle BEFORE the two-tenant block below turns on RLS enforcement.
     let instA: string;

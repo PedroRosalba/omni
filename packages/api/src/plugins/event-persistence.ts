@@ -155,7 +155,7 @@ async function resolveChatUuidById(db: Database, candidate: unknown): Promise<st
 }
 
 /**
- * Opt-in ingest access journal (0081). Read at call time, never cached at
+ * Opt-in ingest access journal (0083). Read at call time, never cached at
  * module load: with the flag unset (the default) no access lookup runs and the
  * fill upserts carry no `accessDecision` key — byte-identical to before.
  */
