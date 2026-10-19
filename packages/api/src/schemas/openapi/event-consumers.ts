@@ -118,7 +118,7 @@ export const CreateConsumerSchema = z.object({
       maxItems: 100,
       description:
         'Scoped consumers only (ignored without scoped: true, as before). Instance-restricted key: defaults to all ' +
-        'of its instances; naming an instance outside the key is 403; an empty result is 400. ' +
+        'of its instances; naming an instance outside the key is 403; an empty result or an unknown instance is 400. ' +
         'Instance-unrestricted key: required and non-empty.',
     }),
 });

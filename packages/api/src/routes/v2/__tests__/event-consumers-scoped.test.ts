@@ -8,14 +8,17 @@
  *  - the create-time scope rules run before any database access, so the real
  *    service over a database that throws on touch proves the HTTP mapping:
  *    malformed scoped instanceIds -> 400 VALIDATION_ERROR, an instance outside
- *    the key -> 403 FORBIDDEN, nothing resolvable -> 400.
+ *    the key -> 403 FORBIDDEN, nothing resolvable -> 400;
+ *  - a scoped create whose ids pass those rules is checked for existence with
+ *    one instances read (fake database): an unknown id -> 400 naming it, all
+ *    known -> 201, and an unscoped create never reads instances.
  *
  * The SQL instance predicate and the owner/non-owner 404s against real rows
  * live in `__tests__/event-consumers-postgres.test.ts`.
  */
 
 import { describe, expect, mock, test } from 'bun:test';
-import type { Database } from '@omni/db';
+import { type Database, instances } from '@omni/db';
 import { Hono } from 'hono';
 import { errorHandler } from '../../../middleware/error';
 import { CreateConsumerSchema } from '../../../schemas/openapi/event-consumers';
@@ -169,5 +172,95 @@ describe('POST /events/consumers scope rules (real service, no database)', () =>
   test('non-uuid instanceIds are refused by the schema (400)', async () => {
     const res = await create({ scoped: true, instanceIds: ['not-a-uuid'] }, UNRESTRICTED_KEY);
     expect(res.status).toBe(400);
+  });
+});
+
+describe('POST /events/consumers resolves scoped instance ids (fake database)', () => {
+  /**
+   * Just enough of the drizzle surface `create` uses: `select().from(t)` is
+   * awaitable (head) and `.where()`-able (instance lookup), and insert returns
+   * the row. `instances` reads answer from `known` and are counted.
+   */
+  function fakeDb(known: string[]) {
+    const calls = { instanceReads: 0, inserts: 0 };
+    const db = {
+      select: () => ({
+        from: (table: unknown) => {
+          if (table === instances) {
+            calls.instanceReads++;
+            return { where: async () => known.map((id) => ({ id })) };
+          }
+          return Promise.resolve([{ head: 0 }]);
+        },
+      }),
+      insert: () => ({
+        values: (values: Record<string, unknown>) => ({
+          onConflictDoNothing: () => ({
+            returning: async () => {
+              calls.inserts++;
+              return [{ id: 'c1', cursor: 0, shared: false, scoped: false, instanceIds: null, ...values }];
+            },
+          }),
+        }),
+      }),
+    };
+    return { db: db as unknown as Database, calls };
+  }
+
+  async function create(db: Database, body: Record<string, unknown>, key: ApiKeyData) {
+    const app = mount(new EventConsumerService(db, null), key);
+    const res = await app.request('/events/consumers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'scoped-one', eventType: 'message.*', ...body }),
+    });
+    return {
+      status: res.status,
+      body: (await res.json()) as {
+        data?: { instanceIds?: string[] };
+        error?: { code?: string; message?: string; details?: unknown };
+      },
+    };
+  }
+
+  test('an unrestricted key naming an unknown instance -> 400 naming it, nothing inserted', async () => {
+    const { db, calls } = fakeDb([INST_A]);
+    const res = await create(db, { scoped: true, instanceIds: [INST_A, INST_C] }, UNRESTRICTED_KEY);
+    expect(res.status).toBe(400);
+    expect(res.body.error?.code).toBe('VALIDATION_ERROR');
+    expect(JSON.stringify(res.body.error)).toContain(INST_C);
+    expect(JSON.stringify(res.body.error)).not.toContain(INST_A);
+    expect(calls).toEqual({ instanceReads: 1, inserts: 0 });
+  });
+
+  test("a restricted key's stale instance (gone from the table) -> 400", async () => {
+    const { db, calls } = fakeDb([INST_A]);
+    const res = await create(db, { scoped: true }, RESTRICTED_KEY);
+    expect(res.status).toBe(400);
+    expect(JSON.stringify(res.body.error)).toContain(INST_B);
+    expect(calls.inserts).toBe(0);
+  });
+
+  test('every instance resolves -> 201 with the scope stored', async () => {
+    const { db, calls } = fakeDb([INST_A, INST_B]);
+    const res = await create(db, { scoped: true, instanceIds: [INST_B] }, RESTRICTED_KEY);
+    expect(res.status).toBe(201);
+    expect(res.body.data?.instanceIds).toEqual([INST_B]);
+    expect(calls).toEqual({ instanceReads: 1, inserts: 1 });
+  });
+
+  test('an uppercase id still resolves against the lowercase column value', async () => {
+    const { db } = fakeDb([INST_C]);
+    const res = await create(db, { scoped: true, instanceIds: [INST_C.toUpperCase()] }, UNRESTRICTED_KEY);
+    expect(res.status).toBe(201);
+  });
+
+  test('no new option: an unscoped create never reads instances', async () => {
+    for (const body of [{}, { instanceIds: [INST_C] }, { scoped: false, instanceIds: ['not-a-uuid'] }]) {
+      const { db, calls } = fakeDb([]);
+      const res = await create(db, body, UNRESTRICTED_KEY);
+      expect(res.status).toBe(201);
+      expect(calls).toEqual({ instanceReads: 0, inserts: 1 });
+    }
   });
 });

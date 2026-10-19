@@ -51,7 +51,7 @@ import type {
   OmniEvent,
   SharedLeaseState,
 } from '@omni/db';
-import { durableConsumers, omniEvents } from '@omni/db';
+import { durableConsumers, instances, omniEvents } from '@omni/db';
 import { type SQL, and, asc, eq, gt, inArray, isNull, lte, or, sql } from 'drizzle-orm';
 import { z } from 'zod';
 import { scopedHandle } from '../tenancy/tenant-scope';
@@ -201,7 +201,8 @@ const ScopedInstanceIdsSchema = z.array(z.string().uuid()).max(100).optional();
  * UUIDs (400 otherwise); an instance-restricted key gets the
  * requested instances (all of its own when omitted) and may not name an
  * instance outside its set (403); an unrestricted key must name a non-empty
- * set. An empty result is a 400. Exported for unit tests.
+ * set. An empty result is a 400. Existence is checked separately at create
+ * time (`assertInstancesResolve`: an unknown instance is a 400). Exported for unit tests.
  */
 export function resolveConsumerScope(
   input: Pick<CreateConsumerInput, 'scoped' | 'instanceIds'>,
@@ -359,8 +360,28 @@ export class EventConsumerService {
     return { ...row, head, lag: computeLag(head, row.cursor), caughtUp };
   }
 
+  /**
+   * A scoped create names only instances that exist and the caller can see:
+   * one read through `scopedHandle`, so under a tenant scope another tenant's
+   * instance is unresolved too (RLS hides it). Unresolved ids are a 400 that
+   * names them. Unscoped creates never reach this (no extra query).
+   */
+  private async assertInstancesResolve(instanceIds: string[]): Promise<void> {
+    const rows = await this.db.select({ id: instances.id }).from(instances).where(inArray(instances.id, instanceIds));
+    const resolved = new Set(rows.map((row) => row.id.toLowerCase()));
+    const unresolved = instanceIds.filter((id) => !resolved.has(id.toLowerCase()));
+    if (unresolved.length > 0) {
+      throw new ValidationError(
+        'a scoped consumer names instances that do not exist',
+        { instanceIds: unresolved },
+        { instanceIds: unresolved },
+      );
+    }
+  }
+
   async create(input: CreateConsumerInput, caller?: ConsumerCaller): Promise<ConsumerWithLag> {
     const scope = resolveConsumerScope(input, caller);
+    if (scope.scoped) await this.assertInstancesResolve(scope.instanceIds);
     const head = await this.head();
     const cursor = resolveInitialCursor(input.startFrom ?? 'now', head);
 

@@ -14,7 +14,8 @@
  *  - lag = journal head minus cursor;
  *  - opt-in instance scoping (0080): a scoped consumer pages only its
  *    instances' rows (cursor still moves past the others) and is invisible
- *    (404) to non-owner restricted keys; unscoped consumers stay global;
+ *    (404) to non-owner restricted keys; unscoped consumers stay global; a
+ *    scoped create naming a nonexistent instance is refused;
  *  - two-tenant containment: under RLS enforcement a tenant-scoped pull only
  *    ever pages its own tenant's journal rows (automation-actions two-tenant
  *    suite precedent).
@@ -484,6 +485,16 @@ postgresDescribe('durable event consumers (#989, real PostgreSQL)', () => {
       expect((await service.ack('legacy-0080', page.cursor, undefined, otherRestricted)).cursor).toBe(page.cursor);
       await service.delete('legacy-0080', otherRestricted);
       await expect(service.inspect('legacy-0080')).rejects.toThrow(/not found/i);
+    });
+
+    test('a scoped create naming an instance that does not exist is refused (400) and stores nothing', async () => {
+      const missing = randomUUID();
+      const refused = service.create(
+        { name: 'scoped-0080-missing', eventType: 'custom.dc0080.*', scoped: true, instanceIds: [instA, missing] },
+        unrestricted,
+      );
+      await expect(refused).rejects.toMatchObject({ code: 'VALIDATION', context: { instanceIds: [missing] } });
+      await expect(service.getByName('scoped-0080-missing')).rejects.toThrow(/not found/i);
     });
 
     test('scoped create stores the owner key and the restricted key instances', async () => {
