@@ -2,13 +2,17 @@
 --
 -- The WhatsApp Baileys plugin holds every outbound send behind a humanized
 -- random delay and a typing simulation (anti-ban protection). Both switches
--- were process-wide env vars only. This column lets one instance opt out:
+-- were process-wide env vars only. These columns let one instance opt out:
 --
---   instances.outbound_pacing  'humanized' (default) | 'immediate'
+--   instances.outbound_pacing           'humanized' (default) | 'immediate'
+--   instances.outbound_pacing_override  boolean, default false
 --
 -- The default 'humanized' keeps every existing row and deployment on today's
--- behaviour; only an explicit 'immediate' (or a per-request `pacing` field)
--- skips the delay and the typing simulation.
+-- behaviour; only an explicit 'immediate' skips the delay and the typing
+-- simulation. A send request's `pacing` field may always ask for 'humanized';
+-- it may ask for 'immediate' only when the instance is already 'immediate' or
+-- the operator set outbound_pacing_override = true (otherwise 403), so an API
+-- key cannot defeat a humanized instance on its own.
 --
 -- Numbering: open PR #1294 also claims 0080. Per the parallel-worktree rule,
 -- whichever PR merges second renumbers its own migration (file, journal idx,
@@ -19,3 +23,4 @@
 -- postgres-js connection, which rejects raw transaction control.
 
 ALTER TABLE "instances" ADD COLUMN IF NOT EXISTS "outbound_pacing" varchar(20) DEFAULT 'humanized' NOT NULL;
+ALTER TABLE "instances" ADD COLUMN IF NOT EXISTS "outbound_pacing_override" boolean DEFAULT false NOT NULL;

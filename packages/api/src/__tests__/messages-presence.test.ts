@@ -464,12 +464,12 @@ describeWithDb('POST /messages/send/presence', () => {
       expect(body.data.hold).toEqual({ expiresAt: '2026-10-18T12:01:00.000Z' });
     });
 
-    test('hold=true accepts a lifetime up to 300000 and rejects above it', async () => {
+    test('hold=true takes its lifetime from holdMaxMs (up to 300000) and rejects above it', async () => {
       const holdMock = holdPresenceMock(300000);
       const { app } = createTestApp(createMockPlugin({ holdPresence: holdMock }));
 
-      const ok = await postPresence(app, { type: 'typing', hold: true, duration: 300000 });
-      const tooLong = await postPresence(app, { type: 'typing', hold: true, duration: 300001 });
+      const ok = await postPresence(app, { type: 'typing', hold: true, holdMaxMs: 300000 });
+      const tooLong = await postPresence(app, { type: 'typing', hold: true, holdMaxMs: 300001 });
 
       expect(ok.status).toBe(200);
       expect(holdMock.mock.calls[0]?.[3]).toBe(300000);

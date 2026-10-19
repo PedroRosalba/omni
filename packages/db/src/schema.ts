@@ -943,6 +943,12 @@ export const instances = pgTable(
       .notNull()
       .default('humanized')
       .$type<'humanized' | 'immediate'>(),
+    /**
+     * Operator consent for per-request pacing: when false (default) a send
+     * request may still ask for 'humanized', but 'immediate' is refused (403)
+     * unless outboundPacing itself is 'immediate'.
+     */
+    outboundPacingOverride: boolean('outbound_pacing_override').notNull().default(false),
     disableUsernamePrefix: boolean('disable_username_prefix').notNull().default(false),
     processMediaOnBlocked: boolean('process_media_on_blocked').notNull().default(true),
     accessMode: varchar('access_mode', { length: 20 }).notNull().default('blocklist').$type<AccessMode>(),

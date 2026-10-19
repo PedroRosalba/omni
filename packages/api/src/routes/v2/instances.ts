@@ -100,7 +100,13 @@ const createInstanceSchema = z.object({
     .enum(['humanized', 'immediate'])
     .default('humanized')
     .describe(
-      "Outbound pacing (WhatsApp Baileys): 'humanized' keeps the anti-ban delay and typing simulation before each send; 'immediate' skips both. Send requests can override it with `pacing`",
+      "Outbound pacing (WhatsApp Baileys): 'humanized' keeps the anti-ban delay and typing simulation before each send; 'immediate' skips both. Send requests may ask for 'humanized' with `pacing`; asking for 'immediate' needs outboundPacingOverride on a humanized instance",
+    ),
+  outboundPacingOverride: z
+    .boolean()
+    .default(false)
+    .describe(
+      "Let send requests choose `pacing: 'immediate'` on a humanized instance. Default false: such requests are refused with 403",
     ),
   isDefault: z.boolean().default(false).describe('Set as default instance for channel'),
   token: z.string().optional().describe('Bot token for Discord instances (required for Discord)'),
@@ -417,6 +423,7 @@ const updateInstanceSchema = createInstanceSchema
     allowFirstParty: z.boolean().optional(),
     // Strip the .default('humanized') so a PATCH that omits it never resets the stored pacing.
     outboundPacing: z.enum(['humanized', 'immediate']).optional(),
+    outboundPacingOverride: z.boolean().optional(),
   })
   // #1211: reject unknown fields (400 naming the key) instead of silently stripping them.
   .strict();

@@ -603,16 +603,31 @@ type OutboundPacing = z.infer<typeof OutboundPacingSchema>;
 // Per-request outbound pacing. No default: an omitted field falls back to the
 // instance's `outboundPacing` column, then 'humanized'.
 const pacingField = OutboundPacingSchema.optional().describe(
-  "Outbound pacing for this send (WhatsApp Baileys): 'immediate' skips the humanized anti-ban delay and typing simulation; 'humanized' keeps them. Default: the instance's outboundPacing",
+  "Outbound pacing for this send (WhatsApp Baileys): 'immediate' skips the humanized anti-ban delay and typing simulation; 'humanized' keeps them. Default: the instance's outboundPacing. 'immediate' on a humanized instance needs the instance's outboundPacingOverride (otherwise 403)",
 );
 
-/** Effective pacing: request field, else the instance column, else 'humanized'. */
+/**
+ * Effective pacing. The operator's instance setting bounds the request:
+ * - request 'humanized' is always honoured;
+ * - request 'immediate' is honoured only when the instance is 'immediate' or
+ *   has outboundPacingOverride, otherwise FORBIDDEN (403);
+ * - no request field: the instance column, else 'humanized'.
+ */
 function resolveOutboundPacing(
   requested: OutboundPacing | undefined,
-  instance: { outboundPacing?: string | null },
+  instance: { id?: string; outboundPacing?: string | null; outboundPacingOverride?: boolean | null },
 ): OutboundPacing {
-  if (requested) return requested;
-  return instance.outboundPacing === 'immediate' ? 'immediate' : 'humanized';
+  const instancePacing: OutboundPacing = instance.outboundPacing === 'immediate' ? 'immediate' : 'humanized';
+  if (requested === undefined) return instancePacing;
+  if (requested === 'humanized') return 'humanized';
+  if (instancePacing === 'immediate' || instance.outboundPacingOverride === true) return 'immediate';
+  throw new OmniError({
+    code: ERROR_CODES.FORBIDDEN,
+    message:
+      "pacing 'immediate' is not allowed on this instance: its outboundPacing is 'humanized'. Set outboundPacingOverride: true on the instance to let send requests choose immediate pacing",
+    context: { instanceId: instance.id },
+    recoverable: false,
+  });
 }
 
 /**
@@ -1284,6 +1299,7 @@ messagesRoutes.post('/send', async (c) => {
     instanceId,
     'canSendText',
   );
+  const effectivePacing = resolveOutboundPacing(pacing, instance);
   const resolvedTo = await resolveRecipient(to, instance.channel, services);
 
   // Get reply context if replying
@@ -1309,7 +1325,7 @@ messagesRoutes.post('/send', async (c) => {
       // way it governs agent-dispatched replies — plugins default to 'convert'
       // when the key is absent (#894).
       ...(instance.messageFormatMode ? { messageFormatMode: instance.messageFormatMode } : {}),
-      ...outboundPacingMetadata(resolveOutboundPacing(pacing, instance)),
+      ...outboundPacingMetadata(effectivePacing),
     },
   };
 
@@ -1400,6 +1416,8 @@ messagesRoutes.post('/send/media', zValidator('json', sendMediaSchema), async (c
     });
   }
 
+  const effectivePacing = resolveOutboundPacing(data.pacing, instance);
+
   // Resolve recipient (handles person ID to platform ID resolution)
   const resolvedTo = await resolveRecipient(data.to, instance.channel, services);
 
@@ -1421,7 +1439,7 @@ messagesRoutes.post('/send/media', zValidator('json', sendMediaSchema), async (c
     metadata: {
       ...buildSendMediaMetadata(data),
       ...(senderAgentId ? { senderAgentId } : {}),
-      ...outboundPacingMetadata(resolveOutboundPacing(data.pacing, instance)),
+      ...outboundPacingMetadata(effectivePacing),
     },
   };
 
@@ -1516,6 +1534,8 @@ messagesRoutes.post('/send/reaction', zValidator('json', sendReactionSchema), as
     });
   }
 
+  const effectivePacing = resolveOutboundPacing(pacing, instance);
+
   // Resolve recipient (handles person ID to platform ID resolution)
   // Note: For reactions, 'to' is typically a chat ID, but we support person ID resolution too
   const resolvedTo = await resolveRecipient(to, instance.channel, services);
@@ -1540,10 +1560,7 @@ messagesRoutes.post('/send/reaction', zValidator('json', sendReactionSchema), as
       emoji,
       targetMessageId,
     } as OutgoingContent,
-    metadata:
-      resolveOutboundPacing(pacing, instance) === 'immediate'
-        ? { ...reactionMetadata, outboundPacing: 'immediate' }
-        : reactionMetadata,
+    metadata: effectivePacing === 'immediate' ? { ...reactionMetadata, outboundPacing: 'immediate' } : reactionMetadata,
   };
 
   // Send via channel plugin
@@ -2303,6 +2320,9 @@ messagesRoutes.post('/send/tts', zValidator('json', sendTtsSchema), async (c) =>
     'canSendMedia',
   );
 
+  // Before synthesis, so a refused pacing never spends a TTS call.
+  const pacing = resolveOutboundPacing(data.pacing, instance);
+
   // Resolve recipient
   const resolvedTo = await resolveRecipient(data.to, instance.channel, services);
 
@@ -2313,8 +2333,6 @@ messagesRoutes.post('/send/tts', zValidator('json', sendTtsSchema), async (c) =>
     stability: data.stability,
     similarityBoost: data.similarityBoost,
   });
-
-  const pacing = resolveOutboundPacing(data.pacing, instance);
 
   // Show "recording" presence before sending (if plugin supports it).
   // Immediate pacing drops the forced wait unless the caller asked for one.
@@ -2534,53 +2552,45 @@ messagesRoutes.post('/send/forward', zValidator('json', forwardMessageSchema), a
 // Presence Routes
 // ============================================================================
 
-/** Upper bound of `duration` for the legacy (non-hold) presence burst. */
-const PRESENCE_BURST_MAX_DURATION_MS = 30_000;
-/** Upper bound of a server-held presence's lifetime (hold=true). */
+/** Upper bound of a server-held presence's lifetime (hold=true, holdMaxMs). */
 const PRESENCE_HOLD_MAX_LIFETIME_MS = 300_000;
 
-// Send presence schema
-const sendPresenceSchema = z
-  .object({
-    instanceId: z.string().uuid().describe('Instance ID to send from'),
-    to: z.string().min(1).describe('Chat ID to show presence in'),
-    type: z.enum(['typing', 'recording', 'paused']).describe('Presence type'),
-    threadId: z.string().min(1).optional().describe('Thread timestamp/id for thread-scoped presence surfaces'),
-    status: z.string().min(1).max(100).optional().describe('Custom status text for channels that support it'),
-    loadingMessages: z
-      .array(z.string().min(1).max(100))
-      .max(10)
-      .optional()
-      .describe('Rotating loading messages for channels that support them'),
-    duration: z
-      .number()
-      .int()
-      .min(0)
-      .max(PRESENCE_HOLD_MAX_LIFETIME_MS)
-      .optional()
-      .describe(
-        'Duration in ms before auto-pause (max 30000); omit for channel default, 0 = until paused. With hold=true: max lifetime of the held presence (max 300000; omit or 0 = server default)',
-      ),
-    hold: z
-      .boolean()
-      .default(false)
-      .describe(
-        "Server-held presence (WhatsApp): Omni re-sends typing/recording until a send to this chat, an explicit 'paused' hold, the max lifetime or a disconnect",
-      ),
-  })
-  .superRefine((value, ctx) => {
-    // Without hold the historical 0-30000 bound applies unchanged.
-    if (!value.hold && value.duration !== undefined && value.duration > PRESENCE_BURST_MAX_DURATION_MS) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.too_big,
-        maximum: PRESENCE_BURST_MAX_DURATION_MS,
-        type: 'number',
-        inclusive: true,
-        path: ['duration'],
-        message: `Number must be less than or equal to ${PRESENCE_BURST_MAX_DURATION_MS}`,
-      });
-    }
-  });
+// Send presence schema. Without hold the fields (duration included) validate
+// exactly as before hold existed.
+const sendPresenceSchema = z.object({
+  instanceId: z.string().uuid().describe('Instance ID to send from'),
+  to: z.string().min(1).describe('Chat ID to show presence in'),
+  type: z.enum(['typing', 'recording', 'paused']).describe('Presence type'),
+  threadId: z.string().min(1).optional().describe('Thread timestamp/id for thread-scoped presence surfaces'),
+  status: z.string().min(1).max(100).optional().describe('Custom status text for channels that support it'),
+  loadingMessages: z
+    .array(z.string().min(1).max(100))
+    .max(10)
+    .optional()
+    .describe('Rotating loading messages for channels that support them'),
+  duration: z
+    .number()
+    .int()
+    .min(0)
+    .max(30000)
+    .optional()
+    .describe('Duration in ms before auto-pause; omit for channel default, 0 = until paused'),
+  hold: z
+    .boolean()
+    .default(false)
+    .describe(
+      "Server-held presence (WhatsApp, opt-in): Omni re-sends typing/recording until a send or reaction to this chat, an explicit 'paused' hold, the max lifetime (holdMaxMs) or a disconnect. `duration` is ignored under hold",
+    ),
+  holdMaxMs: z
+    .number()
+    .int()
+    .min(0)
+    .max(PRESENCE_HOLD_MAX_LIFETIME_MS)
+    .optional()
+    .describe(
+      'Max lifetime in ms of a server-held presence (hold=true only); omit or 0 = server default (WHATSAPP_PRESENCE_MAX_LIFETIME_MS)',
+    ),
+});
 
 type SendPresenceInput = z.infer<typeof sendPresenceSchema>;
 
@@ -2618,13 +2628,14 @@ function hasPresenceHolder(plugin: unknown): plugin is PresenceHolder {
 }
 
 /**
- * hold=true branch of POST /messages/send/presence. The plugin resolves the
- * lifetime (omitted/0 = its default, capped at 300000) and owns the refresh.
+ * hold=true branch of POST /messages/send/presence. The lifetime comes from
+ * holdMaxMs only (`duration` is ignored under hold); the plugin resolves it
+ * (omitted/0 = its default, capped at 300000) and owns the refresh.
  */
 async function sendHeldPresence(
   plugin: unknown,
   channel: string,
-  input: { instanceId: string; chatId: string; type: SendPresenceInput['type']; duration?: number },
+  input: { instanceId: string; chatId: string; type: SendPresenceInput['type']; holdMaxMs?: number },
 ) {
   if (!hasPresenceHolder(plugin)) {
     throw new OmniError({
@@ -2634,7 +2645,7 @@ async function sendHeldPresence(
       recoverable: false,
     });
   }
-  const held = await plugin.holdPresence(input.instanceId, input.chatId, input.type, input.duration);
+  const held = await plugin.holdPresence(input.instanceId, input.chatId, input.type, input.holdMaxMs);
   return {
     success: true,
     data: {
@@ -2669,7 +2680,7 @@ function hasPresenceStatusSender(plugin: unknown): plugin is PresenceStatusSende
  *   assistant.threads.setStatus fallback, #914)
  */
 messagesRoutes.post('/send/presence', zValidator('json', sendPresenceSchema), async (c) => {
-  const { instanceId, to, type, duration, threadId, status, loadingMessages, hold } = c.req.valid('json');
+  const { instanceId, to, type, duration, threadId, status, loadingMessages, hold, holdMaxMs } = c.req.valid('json');
   const services = c.get('services');
   checkInstanceAccess(c.get('apiKey'), instanceId);
 
@@ -2680,7 +2691,9 @@ messagesRoutes.post('/send/presence', zValidator('json', sendPresenceSchema), as
 
   // Opt-in server-held presence; without hold the route below is unchanged.
   if (hold) {
-    return c.json(await sendHeldPresence(plugin, instance.channel, { instanceId, chatId: resolvedTo, type, duration }));
+    return c.json(
+      await sendHeldPresence(plugin, instance.channel, { instanceId, chatId: resolvedTo, type, holdMaxMs }),
+    );
   }
 
   const canSendNativeTyping = plugin.capabilities.canSendTyping === true;
