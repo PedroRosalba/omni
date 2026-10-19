@@ -45,7 +45,7 @@ import type {
   SharedLeaseState,
 } from '@omni/db';
 import { durableConsumers, omniEvents } from '@omni/db';
-import { type SQL, and, asc, eq, gt, isNull, lte, sql } from 'drizzle-orm';
+import { type SQL, and, asc, eq, gt, isNull, lte, or, sql } from 'drizzle-orm';
 import { scopedHandle } from '../tenancy/tenant-scope';
 import { eventTypeFilterClause } from './events';
 
@@ -66,6 +66,9 @@ export interface CreateConsumerInput {
    * Opt-in access filter over the ingest verdict (`omni_events.access_decision`).
    * 'all' (default) adds no predicate. 'allowed'/'denied' require
    * OMNI_JOURNAL_ACCESS_DECISION=true, otherwise create() refuses with a 400.
+   * Without `waitForReady` a row whose fill lands late can be skipped (its
+   * verdict is still NULL when later rows move the cursor); set
+   * `waitForReady` to hold the page until the fill lands.
    */
   access?: ConsumerAccessFilter;
   /**
@@ -201,9 +204,45 @@ const ACCESS_DECISION_ENV = 'OMNI_JOURNAL_ACCESS_DECISION';
  * The scanPage predicate for a consumer's access filter: undefined for 'all'
  * (so the WHERE is exactly the unfiltered one), `access_decision = <filter>`
  * otherwise. Rows journaled without a decision never match a filtered consumer.
+ *
+ * A claimed-but-unfilled row (`journal_ready` false) has no decision yet: the
+ * fill writes `access_decision` and `journal_ready = true` in one upsert.
+ * - Without `waitForReady` the plain predicate excludes that row while later
+ *   rows move the cursor past it, so a row whose fill lands late is skipped.
+ *   `waitForReady` is the fix for an access-filtered consumer.
+ * - With `waitForReady` the predicate widens to
+ *   `access_decision = <filter> OR journal_ready = false`: the not-ready row
+ *   reaches `truncateAtUnready`, which holds the page before it, and
+ *   `matchesConsumerAccess` then drops non-matching survivors in JS (a dead
+ *   not-ready row older than the settle window included) while the cursor
+ *   still advances past them.
  */
-export function accessFilterClause(filter: ConsumerAccessFilter | null | undefined): SQL | undefined {
-  return filter === 'allowed' || filter === 'denied' ? eq(omniEvents.accessDecision, filter) : undefined;
+export function accessFilterClause(
+  filter: ConsumerAccessFilter | null | undefined,
+  waitForReady = false,
+): SQL | undefined {
+  if (filter !== 'allowed' && filter !== 'denied') return undefined;
+  const decided = eq(omniEvents.accessDecision, filter);
+  return waitForReady ? or(decided, eq(omniEvents.journalReady, false)) : decided;
+}
+
+/**
+ * The access filter applied to a scanned page, like the payload filter: true
+ * for 'all', otherwise the row's ingest verdict must equal the filter. Without
+ * `waitForReady` the SQL predicate already guarantees it; with it this drops
+ * the not-ready rows the widened predicate let through.
+ */
+export function matchesConsumerAccess(
+  row: Pick<OmniEvent, 'accessDecision'>,
+  filter: ConsumerAccessFilter | null | undefined,
+): boolean {
+  if (filter !== 'allowed' && filter !== 'denied') return true;
+  return row.accessDecision === filter;
+}
+
+/** True when a scanned row passes the consumer's access filter and payload conditions. */
+function matchesConsumer(row: OmniEvent, consumer: DurableConsumer): boolean {
+  return matchesConsumerAccess(row, consumer.accessFilter) && matchesConsumerPayload(row, consumer.filters);
 }
 
 /**
@@ -366,7 +405,7 @@ export class EventConsumerService {
       scanned = await scan();
     }
 
-    const items = scanned.filter((row) => matchesConsumerPayload(row, consumer.filters));
+    const items = scanned.filter((row) => matchesConsumer(row, consumer));
     const last = scanned[scanned.length - 1];
     const cursor = last ? Number(last.journalSeq) : consumer.cursor;
     if (items.length === 0 && cursor > consumer.cursor) {
@@ -436,7 +475,7 @@ export class EventConsumerService {
     }
 
     const { consumer, lease, scanned } = claim;
-    const items = scanned.filter((row) => matchesConsumerPayload(row, consumer.filters));
+    const items = scanned.filter((row) => matchesConsumer(row, consumer));
     if (lease && items.length === 0) {
       // Nothing to deliver: release now so the cursor moves past filtered-out rows (#1128).
       await this.ackShared(consumer.name, lease.id).catch(() => undefined);
@@ -536,6 +575,9 @@ export class EventConsumerService {
    * EventService.list / #966 contract) minus the exclude globs (#1078), and —
    * only for an access-filtered consumer — the ingest access verdict (0081).
    * Every caller (fresh lease, reclaim, pull, withLag's caughtUp) inherits it.
+   * With `waitForReady` the access predicate also admits not-ready rows (see
+   * `accessFilterClause`), so a pending claim keeps caughtUp false and the
+   * callers apply `matchesConsumerAccess` to whatever survives truncation.
    */
   private async scanPage(
     consumer: DurableConsumer,
@@ -553,7 +595,7 @@ export class EventConsumerService {
           gt(omniEvents.journalSeq, after),
           through === undefined ? undefined : lte(omniEvents.journalSeq, through),
           typeClause,
-          accessFilterClause(consumer.accessFilter),
+          accessFilterClause(consumer.accessFilter, consumer.waitForReady),
         ),
       )
       .orderBy(asc(omniEvents.journalSeq))

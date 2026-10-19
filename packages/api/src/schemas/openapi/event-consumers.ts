@@ -104,7 +104,9 @@ export const CreateConsumerSchema = z.object({
       description:
         "Opt-in access filter. 'all' (default) = every row, unchanged. 'allowed' / 'denied' = only rows whose " +
         'ingest access verdict (omni_events.access_decision) equals it. The verdict is frozen at ingest; call the ' +
-        'access check route for the current one. Requires OMNI_JOURNAL_ACCESS_DECISION=true (else 400).',
+        'access check route for the current one. Requires OMNI_JOURNAL_ACCESS_DECISION=true (else 400). ' +
+        'Without waitForReady a row whose fill lands late (verdict still unset) can be skipped; set waitForReady ' +
+        'to hold the page until it lands.',
     }),
   waitForReady: z
     .boolean()
