@@ -114,6 +114,12 @@ const createInstanceSchema = z.object({
   ttsVoiceId: z.string().optional().nullable().describe('Default ElevenLabs voice ID for this instance'),
   ttsModelId: z.string().optional().nullable().describe('Default ElevenLabs model for this instance'),
   accessMode: AccessModeSchema.optional().describe('Access control mode: disabled, blocklist, or allowlist'),
+  audioTranscription: z
+    .enum(['auto', 'off'])
+    .default('auto')
+    .describe(
+      "Server-side transcription of inbound audio: 'auto' (default, transcribed as always) or 'off' (stored but never sent to STT; a skipped media.processed is emitted instead)",
+    ),
   agentWaitForMedia: z.boolean().default(true).describe('Wait for media processing before dispatching to agent'),
   agentSendMediaPath: z.boolean().default(true).describe('Include file path in formatted media text sent to agent'),
   agentSendMediaPathTypes: z
@@ -403,6 +409,7 @@ const updateInstanceSchema = createInstanceSchema
     // Override fields with .default() to strip the default — omitted keys must stay undefined
     // so PATCH only updates what is explicitly sent (not reset to defaults)
     readReceipts: z.enum(['on', 'off', 'exclude-self']).optional(),
+    audioTranscription: z.enum(['auto', 'off']).optional(),
     markOnlineOnConnect: z.boolean().optional(),
     historyIdentity: z.enum(['desktop', 'web']).optional(),
     syncFullHistory: z.boolean().optional(),

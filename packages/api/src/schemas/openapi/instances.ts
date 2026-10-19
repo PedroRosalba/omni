@@ -133,6 +133,10 @@ export const InstanceSchema = z.object({
   syncFullHistory: z.boolean().openapi({ description: 'WhatsApp (Baileys): request full history on connect' }),
   outboundPacing: z.enum(['humanized', 'immediate']).optional().openapi({ description: OUTBOUND_PACING_DESCRIPTION }),
   outboundPacingOverride: z.boolean().optional().openapi({ description: OUTBOUND_PACING_OVERRIDE_DESCRIPTION }),
+  audioTranscription: z.enum(['auto', 'off']).openapi({
+    description:
+      "Server-side transcription of inbound audio: 'auto' (transcribed as always) or 'off' (stored but never sent to STT)",
+  }),
   ownerIdentifier: z.string().nullable().openapi({ description: 'Owner identifier' }),
   agentId: z.string().uuid().nullable().optional().openapi({ description: 'Agent UUID (agents table)' }),
   agentProviderId: z
@@ -188,6 +192,10 @@ export const CreateInstanceSchema = z.object({
     .default('humanized')
     .openapi({ description: OUTBOUND_PACING_DESCRIPTION }),
   outboundPacingOverride: z.boolean().default(false).openapi({ description: OUTBOUND_PACING_OVERRIDE_DESCRIPTION }),
+  audioTranscription: z.enum(['auto', 'off']).default('auto').openapi({
+    description:
+      "Server-side transcription of inbound audio (default: auto). 'auto' = transcribed as always; 'off' = stored but never sent to STT, and a skipped media.processed is emitted instead",
+  }),
   gupshupHandoffOptions: GupshupHandoffOptionsSchema.nullable()
     .optional()
     .openapi({
