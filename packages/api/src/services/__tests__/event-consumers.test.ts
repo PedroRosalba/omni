@@ -277,7 +277,22 @@ describe('instance-scoped consumers (opt-in, 0082)', () => {
       'FORBIDDEN',
     );
     expect(codeOf(() => resolveConsumerScope({ scoped: true, instanceIds: [] }, restricted))).toBe('VALIDATION');
-    expect(codeOf(() => resolveConsumerScope({ scoped: true }, { keyId: 'k', instanceIds: [] }))).toBe('VALIDATION');
+    // A UUID owner key, so the zero-instance branch (not the owner check) is what refuses it.
+    expect(codeOf(() => resolveConsumerScope({ scoped: true }, { keyId: KEY_RESTRICTED, instanceIds: [] }))).toBe(
+      'VALIDATION',
+    );
+  });
+
+  test('restricted key: instance ids match case-insensitively and are stored lowercase', () => {
+    const upper = resolveConsumerScope({ scoped: true, instanceIds: [INST_A.toUpperCase()] }, restricted);
+    expect(upper).toMatchObject({ scoped: true, instanceIds: [INST_A] });
+    const mixedKey: ConsumerCaller = { keyId: KEY_RESTRICTED, instanceIds: [INST_A.toUpperCase()] };
+    expect(resolveConsumerScope({ scoped: true, instanceIds: [INST_A] }, mixedKey)).toMatchObject({
+      instanceIds: [INST_A],
+    });
+    expect(resolveConsumerScope({ scoped: true, instanceIds: [INST_B.toUpperCase()] }, unrestricted)).toMatchObject({
+      instanceIds: [INST_B],
+    });
   });
 
   test('unrestricted key: instanceIds is required and non-empty', () => {

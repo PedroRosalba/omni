@@ -258,8 +258,10 @@ export function resolveConsumerScope(
     throw new ValidationError('a scoped consumer needs an API key to own it', { scoped: ['no calling API key'] });
   }
 
-  const requested = parsedIds.data ? [...new Set(parsedIds.data)] : undefined;
-  const keyInstances = caller?.instanceIds ?? null;
+  // Instance ids are UUIDs: normalise to lowercase once, so membership checks,
+  // the stored set and later narrowing all compare the same spelling.
+  const requested = parsedIds.data ? [...new Set(parsedIds.data.map((id) => id.toLowerCase()))] : undefined;
+  const keyInstances = caller?.instanceIds ? caller.instanceIds.map((id) => id.toLowerCase()) : null;
   if (keyInstances === null) {
     if (!requested?.length) {
       throw new ValidationError('a scoped consumer on an instance-unrestricted key needs a non-empty instanceIds', {
@@ -316,9 +318,12 @@ function consumerAccessClause(caller?: ConsumerCaller): SQL | undefined {
  * consumers and unrestricted callers are returned unchanged. Exported for unit tests.
  */
 export function narrowToCaller(consumer: DurableConsumer, caller?: ConsumerCaller): DurableConsumer {
-  const keyInstances = caller?.instanceIds;
+  const keyInstances = caller?.instanceIds?.map((id) => id.toLowerCase());
   if (!consumer.scoped || !keyInstances) return consumer;
-  return { ...consumer, instanceIds: (consumer.instanceIds ?? []).filter((id) => keyInstances.includes(id)) };
+  return {
+    ...consumer,
+    instanceIds: (consumer.instanceIds ?? []).filter((id) => keyInstances.includes(id.toLowerCase())),
+  };
 }
 
 /** A scoped consumer pages only its instances' rows; an empty set fails closed. */
