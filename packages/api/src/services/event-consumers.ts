@@ -53,6 +53,7 @@ import type {
 } from '@omni/db';
 import { durableConsumers, omniEvents } from '@omni/db';
 import { type SQL, and, asc, eq, gt, inArray, isNull, lte, or, sql } from 'drizzle-orm';
+import { z } from 'zod';
 import { scopedHandle } from '../tenancy/tenant-scope';
 import { eventTypeFilterClause } from './events';
 
@@ -71,8 +72,11 @@ export interface CreateConsumerInput {
   shared?: boolean;
   /** Opt-in instance scoping + ownership (0080). Default false = today's global consumer. */
   scoped?: boolean;
-  /** Scoped consumers only: instance UUIDs to page. Rejected without `scoped: true`. */
-  instanceIds?: string[];
+  /**
+   * Scoped consumers only: instance UUIDs to page (validated there). Ignored
+   * without `scoped: true`, as an unknown field was before 0080.
+   */
+  instanceIds?: unknown;
 }
 
 /**
@@ -188,10 +192,13 @@ function ownerKeyOf(caller?: ConsumerCaller): string | null {
   return keyId && UUID_RE.test(keyId) ? keyId : null;
 }
 
+const ScopedInstanceIdsSchema = z.array(z.string().uuid()).max(100).optional();
+
 /**
  * Resolve the scope columns for a create. Unscoped (the default) is exactly
- * the pre-0080 consumer; `instanceIds` without `scoped: true` is refused
- * rather than silently ignored. Scoped: an instance-restricted key gets the
+ * the pre-0080 consumer, and any `instanceIds` sent with it is ignored as it
+ * was before (an unknown field). Scoped: the instanceIds must be up to 100
+ * UUIDs (400 otherwise); an instance-restricted key gets the
  * requested instances (all of its own when omitted) and may not name an
  * instance outside its set (403); an unrestricted key must name a non-empty
  * set. An empty result is a 400. Exported for unit tests.
@@ -200,13 +207,13 @@ export function resolveConsumerScope(
   input: Pick<CreateConsumerInput, 'scoped' | 'instanceIds'>,
   caller?: ConsumerCaller,
 ): ConsumerScope {
-  if (!input.scoped) {
-    if (input.instanceIds !== undefined) {
-      throw new ValidationError('instanceIds is only valid with scoped: true', {
-        instanceIds: ['requires scoped: true'],
-      });
-    }
-    return { scoped: false, instanceIds: null, ownerKeyId: null };
+  if (!input.scoped) return { scoped: false, instanceIds: null, ownerKeyId: null };
+
+  const parsedIds = ScopedInstanceIdsSchema.safeParse(input.instanceIds);
+  if (!parsedIds.success) {
+    throw new ValidationError('instanceIds must be an array of up to 100 instance UUIDs', {
+      instanceIds: ['array of up to 100 UUIDs'],
+    });
   }
 
   const ownerKeyId = ownerKeyOf(caller);
@@ -214,7 +221,7 @@ export function resolveConsumerScope(
     throw new ValidationError('a scoped consumer needs an API key to own it', { scoped: ['no calling API key'] });
   }
 
-  const requested = input.instanceIds ? [...new Set(input.instanceIds)] : undefined;
+  const requested = parsedIds.data ? [...new Set(parsedIds.data)] : undefined;
   const keyInstances = caller?.instanceIds ?? null;
   if (keyInstances === null) {
     if (!requested?.length) {
@@ -263,6 +270,18 @@ function consumerAccessClause(caller?: ConsumerCaller): SQL | undefined {
   const unscoped = eq(durableConsumers.scoped, false);
   const keyId = ownerKeyOf(caller);
   return keyId ? or(unscoped, eq(durableConsumers.ownerKeyId, keyId)) : unscoped;
+}
+
+/**
+ * The consumer as `caller` may page it: a scoped consumer pulled by an
+ * instance-restricted key (its owner) pages only the stored instances the key
+ * still has, so narrowing the key later also narrows the pull. Unscoped
+ * consumers and unrestricted callers are returned unchanged. Exported for unit tests.
+ */
+export function narrowToCaller(consumer: DurableConsumer, caller?: ConsumerCaller): DurableConsumer {
+  const keyInstances = caller?.instanceIds;
+  if (!consumer.scoped || !keyInstances) return consumer;
+  return { ...consumer, instanceIds: (consumer.instanceIds ?? []).filter((id) => keyInstances.includes(id)) };
 }
 
 /** A scoped consumer pages only its instances' rows; an empty set fails closed. */
@@ -413,8 +432,8 @@ export class EventConsumerService {
   async pull(name: string, options: PullOptions = {}, caller?: ConsumerCaller): Promise<PullResult> {
     const limit = Math.min(Math.max(options.limit ?? 100, 1), PULL_MAX_LIMIT);
     const waitMs = Math.min(Math.max(options.waitMs ?? 0, 0), PULL_MAX_WAIT_MS);
-    const consumer = await this.getVisible(name, caller);
-    if (consumer.shared) return this.pullShared(consumer, limit, waitMs, options.leaseMs ?? DEFAULT_LEASE_MS);
+    const consumer = narrowToCaller(await this.getVisible(name, caller), caller);
+    if (consumer.shared) return this.pullShared(consumer, limit, waitMs, options.leaseMs ?? DEFAULT_LEASE_MS, caller);
 
     const deadline = Date.now() + waitMs;
     let scanned = await this.scanPage(consumer, limit);
@@ -492,12 +511,13 @@ export class EventConsumerService {
     limit: number,
     waitMs: number,
     leaseMs: number,
+    caller?: ConsumerCaller,
   ): Promise<PullResult> {
     const deadline = Date.now() + waitMs;
     let claim = await this.claimShared(initial, limit, leaseMs);
     while (!claim.lease && Date.now() < deadline) {
       await new Promise<void>((resolve) => setTimeout(resolve, PULL_POLL_INTERVAL_MS));
-      claim = await this.claimShared(await this.getByName(initial.name), limit, leaseMs);
+      claim = await this.claimShared(narrowToCaller(await this.getByName(initial.name), caller), limit, leaseMs);
     }
 
     const { consumer, lease, scanned } = claim;
@@ -540,7 +560,9 @@ export class EventConsumerService {
       if (await this.casLeaseState(consumer, claimLease(state, lease, plan.reclaim?.id))) {
         return { consumer, lease, scanned };
       }
-      consumer = await this.getByName(consumer.name);
+      // Keep a caller-narrowed instance set (narrowToCaller) across the re-read.
+      const fresh = await this.getByName(consumer.name);
+      consumer = fresh.scoped ? { ...fresh, instanceIds: start.instanceIds } : fresh;
     }
     throw new ConflictError('DurableConsumer', `too much contention leasing '${start.name}', retry`, {
       name: start.name,

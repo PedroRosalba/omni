@@ -7,7 +7,7 @@
  *    without the new options reaches the service exactly as before;
  *  - the create-time scope rules run before any database access, so the real
  *    service over a database that throws on touch proves the HTTP mapping:
- *    instanceIds without scoped -> 400 VALIDATION_ERROR, an instance outside
+ *    malformed scoped instanceIds -> 400 VALIDATION_ERROR, an instance outside
  *    the key -> 403 FORBIDDEN, nothing resolvable -> 400.
  *
  * The SQL instance predicate and the owner/non-owner 404s against real rows
@@ -18,6 +18,7 @@ import { describe, expect, mock, test } from 'bun:test';
 import type { Database } from '@omni/db';
 import { Hono } from 'hono';
 import { errorHandler } from '../../../middleware/error';
+import { CreateConsumerSchema } from '../../../schemas/openapi/event-consumers';
 import { EventConsumerService } from '../../../services/event-consumers';
 import type { ApiKeyData, AppVariables } from '../../../types';
 import { eventConsumersRoutes } from '../event-consumers';
@@ -129,14 +130,22 @@ describe('POST /events/consumers scope rules (real service, no database)', () =>
     return { status: res.status, body: (await res.json()) as { error?: { code?: string } } };
   }
 
-  test('instanceIds without scoped: true -> 400 VALIDATION_ERROR', async () => {
-    for (const key of [RESTRICTED_KEY, UNRESTRICTED_KEY]) {
-      for (const body of [{ instanceIds: [INST_A] }, { scoped: false, instanceIds: [INST_A] }]) {
-        const res = await create(body, key);
-        expect(res.status).toBe(400);
-        expect(res.body.error?.code).toBe('VALIDATION_ERROR');
-      }
+  test('no new option: instanceIds without scoped: true still passes request validation (ignored, as before)', () => {
+    for (const body of [
+      { instanceIds: [INST_A] },
+      { scoped: false, instanceIds: ['not-a-uuid'] },
+      { instanceIds: 'anything' },
+    ]) {
+      expect(CreateConsumerSchema.safeParse({ name: 'legacy-one', eventType: 'message.*', ...body }).success).toBe(
+        true,
+      );
     }
+  });
+
+  test('scoped create with malformed instanceIds -> 400 VALIDATION_ERROR', async () => {
+    const res = await create({ scoped: true, instanceIds: ['not-a-uuid'] }, RESTRICTED_KEY);
+    expect(res.status).toBe(400);
+    expect(res.body.error?.code).toBe('VALIDATION_ERROR');
   });
 
   test('scoped create naming an instance outside the restricted key -> 403 FORBIDDEN', async () => {

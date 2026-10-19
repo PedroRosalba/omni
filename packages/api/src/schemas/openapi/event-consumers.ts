@@ -106,15 +106,20 @@ export const CreateConsumerSchema = z.object({
         'consumer is owned by the calling API key and pulls only journal rows of its instanceIds; only the owner ' +
         'key or an instance-unrestricted key can inspect, pull, ack, delete or list it (others get 404).',
     }),
+  // Typed loosely on purpose: before 0080 an unknown `instanceIds` was stripped, so a legacy client that
+  // sends one (any shape) without `scoped: true` must keep being accepted and ignored. The service
+  // validates it (array of up to 100 UUIDs) only for scoped consumers.
   instanceIds: z
-    .array(z.string().uuid())
-    .max(100)
+    .unknown()
     .optional()
     .openapi({
+      type: 'array',
+      items: { type: 'string', format: 'uuid' },
+      maxItems: 100,
       description:
-        'Scoped consumers only (400 without scoped: true). Instance-restricted key: defaults to all of its ' +
-        'instances; naming an instance outside the key is 403; an empty result is 400. Instance-unrestricted key: ' +
-        'required and non-empty.',
+        'Scoped consumers only (ignored without scoped: true, as before). Instance-restricted key: defaults to all ' +
+        'of its instances; naming an instance outside the key is 403; an empty result is 400. ' +
+        'Instance-unrestricted key: required and non-empty.',
     }),
 });
 
@@ -213,7 +218,7 @@ export function registerEventConsumerSchemas(registry: OpenAPIRegistry): void {
         content: { 'application/json': { schema: z.object({ data: DurableConsumerSchema }) } },
       },
       400: {
-        description: 'instanceIds without scoped: true, or a scoped consumer with no resolvable instances',
+        description: 'A scoped consumer with invalid or no resolvable instanceIds',
         content: { 'application/json': { schema: ErrorSchema } },
       },
       403: {
