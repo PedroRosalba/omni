@@ -45,7 +45,8 @@ import type {
 } from '@omni/db';
 import { durableConsumers, omniEvents } from '@omni/db';
 import { type SQL, and, asc, eq, gt, isNull, lte, sql } from 'drizzle-orm';
-import { scopedHandle } from '../tenancy/tenant-scope';
+import { runDetachedFromTenantScope, scopedHandle } from '../tenancy/tenant-scope';
+import { runTenantWorkDb } from '../tenancy/worker-tenant-context';
 import { eventTypeFilterClause } from './events';
 
 /** Where a new consumer's cursor starts: the journal head (default) or 0 (full replay). */
@@ -108,6 +109,24 @@ export interface PullResult {
   /** Shared consumers: ack with this id (not the cursor). Absent when nothing was delivered. */
   leaseId?: string;
 }
+
+/**
+ * One page of the SSE stream (`GET /events/consumers/:name/stream`). Same
+ * scan as pull, read-only: nothing here writes the cursor or a lease.
+ */
+export interface StreamScanResult {
+  /** Rows matching the type filter AND payload conditions, ascending journal_seq. */
+  items: OmniEvent[];
+  /** Highest journal_seq SCANNED (matched or not), or null when nothing was scanned. */
+  through: number | null;
+  /** The page was cut before a claimed-but-unfilled row younger than the settle window. */
+  held: boolean;
+  /** The page came back full and uncut: more rows are already waiting. */
+  full: boolean;
+}
+
+/** Rows the stream scans per page (matches are <= this). */
+const STREAM_PAGE_LIMIT = 100;
 
 const PULL_POLL_INTERVAL_MS = 500;
 const PULL_MAX_LIMIT = 500;
@@ -384,6 +403,59 @@ export class EventConsumerService {
     }
 
     return this.withLag(updated, await this.head());
+  }
+
+  /**
+   * The consumer behind an SSE stream. Fan-out consumers only: a shared
+   * consumer is refused (400), because handing out leases is the pull path's
+   * job and the stream never takes or acks one.
+   */
+  async getStreamable(name: string): Promise<DurableConsumer> {
+    const consumer = await this.getByName(name);
+    if (consumer.shared) {
+      throw new ValidationError(
+        `consumer '${name}' is shared — streams serve fan-out consumers only; pull and ack with the leaseId`,
+        undefined,
+        { name },
+      );
+    }
+    return consumer;
+  }
+
+  /**
+   * One SSE stream page strictly after `after`: the pull scan (type filter,
+   * exclude globs, payload conditions) with the readiness gate ALWAYS on,
+   * whatever the consumer's own waitForReady says, so a hollow row is held
+   * rather than pushed. Read-only: never writes the cursor or a lease.
+   *
+   * A stream outlives the request that opened it, and with a tenant
+   * credential that request's transaction has committed by the time a later
+   * page is read. So every page runs detached from the request scope, in a
+   * short worker transaction of its own for `trustedTenantId` (the tenant the
+   * request scope resolved), or on the ambient pool for a legacy credential.
+   * The consumer is re-read per page, so a deleted consumer ends the stream.
+   */
+  async scanForStream(
+    name: string,
+    after: number,
+    trustedTenantId: string | null,
+    limit: number = STREAM_PAGE_LIMIT,
+  ): Promise<StreamScanResult> {
+    return runDetachedFromTenantScope(() =>
+      runTenantWorkDb(this.pool, trustedTenantId, async () => {
+        const consumer = await this.getStreamable(name);
+        const page = await this.scanPage(consumer, limit, after);
+        const rows = truncateAtUnready(page, true, resolveConsumerSettleMs(), Date.now());
+        const held = rows.length < page.length;
+        const last = rows[rows.length - 1];
+        return {
+          items: rows.filter((row) => matchesConsumerPayload(row, consumer.filters)),
+          through: last ? Number(last.journalSeq) : null,
+          held,
+          full: !held && page.length === limit,
+        };
+      }),
+    );
   }
 
   /** Shared pull: lease the next page (or an expired one) to this caller alone. */

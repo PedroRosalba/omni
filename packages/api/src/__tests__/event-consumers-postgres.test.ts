@@ -586,6 +586,38 @@ postgresDescribe('durable event consumers (#989, real PostgreSQL)', () => {
       const acked = await service.ack('jr-gate-shared', 0, page.leaseId);
       expect(acked.cursor).toBe(seq);
     });
+
+    test('(f) SSE stream scan: catches up filled rows, holds a hollow row (gate forced on), never writes the cursor', async () => {
+      // No waitForReady on the consumer: the stream applies the gate anyway.
+      const consumer = await service.create({ name: 'jr-stream', eventType: 'message.received' });
+      expect(consumer.waitForReady).toBe(false);
+      const first = await claim('f1');
+      await fill(first.id, 'f1');
+      const hollow = await claim('f2');
+
+      const catchUp = await service.scanForStream('jr-stream', consumer.cursor, null);
+      expect(catchUp.items.map((e) => e.id)).toEqual([first.id]);
+      expect(catchUp.through).toBe(first.seq);
+      expect(catchUp.held).toBe(true);
+      expect(catchUp.full).toBe(false);
+
+      const stillHeld = await service.scanForStream('jr-stream', first.seq, null);
+      expect(stillHeld).toEqual({ items: [], through: null, held: true, full: false });
+
+      await fill(hollow.id, 'f2');
+      const live = await service.scanForStream('jr-stream', first.seq, null);
+      expect(live.items.map((e) => e.id)).toEqual([hollow.id]);
+      expect(live.items[0]?.rawPayload).toEqual({ kind: 'jr', tag: 'f2' });
+      expect(live.through).toBe(hollow.seq);
+      expect(live.held).toBe(false);
+
+      expect((await service.getByName('jr-stream')).cursor).toBe(consumer.cursor);
+    });
+
+    test('(g) SSE stream scan refuses a shared consumer', async () => {
+      await service.create({ name: 'jr-stream-shared', eventType: 'message.received', shared: true });
+      await expect(service.scanForStream('jr-stream-shared', 0, null)).rejects.toThrow(/shared/);
+    });
   });
 
   describe('two-tenant containment under RLS enforcement', () => {
