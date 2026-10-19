@@ -218,6 +218,14 @@ export const SendPresenceSchema = z.object({
     .max(30000)
     .optional()
     .openapi({ description: 'Duration in ms before auto-pause; omit for channel default, 0 = until paused' }),
+  hold: z.boolean().default(false).openapi({
+    description:
+      "Server-held presence (WhatsApp, opt-in): Omni re-sends typing/recording until a send or reaction to this chat, an explicit 'paused' hold, the max lifetime (holdMaxMs) or a disconnect. `duration` is ignored under hold",
+  }),
+  holdMaxMs: z.number().int().min(0).max(300000).optional().openapi({
+    description:
+      'Max lifetime in ms of a server-held presence (hold=true only); omit or 0 = server default (WHATSAPP_PRESENCE_MAX_LIFETIME_MS)',
+  }),
 });
 
 // Presence response
