@@ -301,6 +301,8 @@ type PresenceHold = {
   /** Re-send timer; set only once the first presence frame went out. */
   refresh?: ReturnType<typeof setInterval>;
   lifetime: ReturnType<typeof setTimeout>;
+  /** The Baileys state this hold keeps showing. */
+  presence: 'composing' | 'recording';
   /** Why the hold left the registry: 'replaced' by a newer hold on the chat, or 'ended' (paused/send/reaction/expiry/disconnect). */
   endedBy: 'replaced' | 'ended' | null;
 };
@@ -2048,7 +2050,7 @@ export class WhatsAppPlugin extends BaseChannelPlugin {
       WHATSAPP_PRESENCE_HOLD_LIFETIME_CAP_MS,
     );
     const presence = type === 'recording' ? 'recording' : 'composing';
-    const hold = this.registerPresenceHold(key, lifetimeMs);
+    const hold = this.registerPresenceHold(key, lifetimeMs, presence);
     const expiresAt = Date.now() + lifetimeMs;
 
     try {
@@ -2059,7 +2061,7 @@ export class WhatsAppPlugin extends BaseChannelPlugin {
     }
 
     if (this.presenceHolds.get(key) !== hold) {
-      await this.settleSupersededPresenceHold(hold, sock, jid);
+      await this.settleSupersededPresenceHold(hold, key, sock, jid);
       return { expiresAt: null, lifetimeMs: 0 };
     }
 
@@ -2085,8 +2087,9 @@ export class WhatsAppPlugin extends BaseChannelPlugin {
   }
 
   /** Put a fresh hold, with its lifetime timer, in the registry. */
-  private registerPresenceHold(key: string, lifetimeMs: number): PresenceHold {
+  private registerPresenceHold(key: string, lifetimeMs: number, presence: 'composing' | 'recording'): PresenceHold {
     const hold: PresenceHold = {
+      presence,
       lifetime: setTimeout(() => {
         if (this.presenceHolds.get(key) === hold) this.clearPresenceHold(key);
       }, lifetimeMs),
@@ -2097,14 +2100,22 @@ export class WhatsAppPlugin extends BaseChannelPlugin {
   }
 
   /**
-   * A hold left the registry while its first frame was in flight. A newer hold
-   * owns the chat when it was replaced; otherwise the stop's 'paused' may have
-   * gone out before our frame, so send 'paused' again (best-effort).
+   * A hold left the registry while its first frame was in flight, so that
+   * frame may have gone out after whatever superseded it. Re-assert the chat's
+   * current state (best-effort): the live hold's presence when a newer hold
+   * owns the chat, otherwise 'paused' (the stop's own 'paused' may have gone
+   * out before our frame).
    */
-  private async settleSupersededPresenceHold(hold: PresenceHold, sock: WASocket, jid: string): Promise<void> {
-    if (hold.endedBy === 'replaced') return;
+  private async settleSupersededPresenceHold(
+    hold: PresenceHold,
+    key: string,
+    sock: WASocket,
+    jid: string,
+  ): Promise<void> {
+    const live = this.presenceHolds.get(key);
+    if (!live && hold.endedBy === 'replaced') return;
     try {
-      await sock.sendPresenceUpdate('paused', jid);
+      await sock.sendPresenceUpdate(live ? live.presence : 'paused', jid);
     } catch {
       // Best-effort: the chat's indicator also times out on the recipient side
     }

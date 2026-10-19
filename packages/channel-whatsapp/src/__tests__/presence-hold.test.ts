@@ -351,13 +351,14 @@ describe('WhatsAppPlugin.holdPresence', () => {
       expect(firstResult.expiresAt).toBeNull();
       expect(secondResult.expiresAt).toBe(Date.now() + 60_000);
       expect(internals.presenceHolds.size).toBe(1);
-      expect(presences(calls, 'composing')).toHaveLength(2);
+      // Two first frames plus one re-assert of the live hold by the superseded call.
+      expect(presences(calls, 'composing')).toHaveLength(3);
       expect(presences(calls, 'paused')).toHaveLength(0);
 
       await advance(10_000);
-      expect(presences(calls, 'composing')).toHaveLength(3);
-      await advance(10_000);
       expect(presences(calls, 'composing')).toHaveLength(4);
+      await advance(10_000);
+      expect(presences(calls, 'composing')).toHaveLength(5);
     });
 
     it('the later call still wins when its frame goes out first', async () => {
@@ -374,8 +375,11 @@ describe('WhatsAppPlugin.holdPresence', () => {
       expect((await first).expiresAt).toBeNull();
 
       expect(internals.presenceHolds.size).toBe(1);
-      await advance(10_000);
+      // The stale 'composing' frame landed last, so the superseded call re-asserts 'recording'.
+      expect(presences(calls).at(-1)).toEqual(['presence', 'recording', PHONE_JID]);
       expect(presences(calls, 'recording')).toHaveLength(2);
+      await advance(10_000);
+      expect(presences(calls, 'recording')).toHaveLength(3);
       expect(presences(calls, 'composing')).toHaveLength(1);
     });
 
@@ -396,6 +400,27 @@ describe('WhatsAppPlugin.holdPresence', () => {
       await advance(120_000);
       expect(presences(calls, 'composing')).toHaveLength(1);
       expect(presences(calls).at(-1)).toEqual(['presence', 'paused', PHONE_JID]);
+    });
+
+    it("a stale first frame settling after 'paused' and a newer hold re-asserts the newer hold", async () => {
+      const { plugin, calls, internals, pending, stopDeferring } = createDeferredPlugin();
+
+      const stale = plugin.holdPresence(INSTANCE_ID, PHONE, 'typing');
+      await flush();
+      stopDeferring();
+      await plugin.holdPresence(INSTANCE_ID, PHONE, 'paused');
+      const newer = await plugin.holdPresence(INSTANCE_ID, PHONE, 'recording');
+      expect(newer.expiresAt).not.toBeNull();
+
+      pending[0]?.resolve();
+      expect((await stale).expiresAt).toBeNull();
+
+      expect(internals.presenceHolds.size).toBe(1);
+      expect(presences(calls).at(-1)).toEqual(['presence', 'recording', PHONE_JID]);
+      expect(presences(calls, 'paused')).toHaveLength(1);
+      await advance(10_000);
+      expect(presences(calls).at(-1)).toEqual(['presence', 'recording', PHONE_JID]);
+      expect(presences(calls, 'recording')).toHaveLength(3);
     });
 
     it("a send during the first frame's await ends the hold and leaves the chat paused", async () => {
