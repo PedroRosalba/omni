@@ -137,6 +137,10 @@ export const InstanceSchema = z.object({
     description:
       "Server-side transcription of inbound audio: 'auto' (transcribed as always) or 'off' (stored but never sent to STT)",
   }),
+  inboundReplyContext: z.boolean().openapi({
+    description:
+      'WhatsApp (Baileys): typed replyTo on message.received and target on reaction.received/removed (false = events unchanged)',
+  }),
   ownerIdentifier: z.string().nullable().openapi({ description: 'Owner identifier' }),
   agentId: z.string().uuid().nullable().optional().openapi({ description: 'Agent UUID (agents table)' }),
   agentProviderId: z
@@ -195,6 +199,10 @@ export const CreateInstanceSchema = z.object({
   audioTranscription: z.enum(['auto', 'off']).default('auto').openapi({
     description:
       "Server-side transcription of inbound audio (default: auto). 'auto' = transcribed as always; 'off' = stored but never sent to STT, and a skipped media.processed is emitted instead",
+  }),
+  inboundReplyContext: z.boolean().default(false).openapi({
+    description:
+      'WhatsApp (Baileys): add the typed replyTo to message.received and target to reaction.received/removed (default: false = events unchanged). Read at connect: restart the instance after changing it',
   }),
   gupshupHandoffOptions: GupshupHandoffOptionsSchema.nullable()
     .optional()
