@@ -12,7 +12,7 @@
  *    are honored, and the scanned cursor advances past filtered-out rows;
  *  - `startFrom: 'now'` skips history, `'beginning'` replays it;
  *  - lag = journal head minus cursor;
- *  - opt-in instance scoping (0080): a scoped consumer pages only its
+ *  - opt-in instance scoping (0082): a scoped consumer pages only its
  *    instances' rows (cursor still moves past the others) and is invisible
  *    (404) to non-owner restricted keys; unscoped consumers stay global; a
  *    scoped create naming a nonexistent instance is refused;
@@ -41,6 +41,8 @@ import {
   omniEvents,
 } from '@omni/db';
 import { driverRejection, provisionMigratedDatabase } from '@omni/db/pg-migrated-template';
+import { eq } from 'drizzle-orm';
+import { createPluginContext } from '../plugins/context';
 import { setupEventPersistence } from '../plugins/event-persistence';
 import { type ConsumerCaller, EventConsumerService } from '../services/event-consumers';
 import { runInWorkerTenantScope } from '../tenancy/worker-tenant-context';
@@ -106,6 +108,22 @@ async function captureCustomHandler(db: Database): Promise<CustomEventHandler> {
   await setupEventPersistence(mockBus, db);
   const handler = subscriptions.get('custom.>');
   if (!handler) throw new Error('custom.> subscriber was not registered');
+  return handler;
+}
+
+/** Capture the real `message.received` persistence fill (the upsert that completes a claimed row). */
+async function captureMessageReceivedHandler(db: Database): Promise<CustomEventHandler> {
+  const subscriptions = new Map<string, CustomEventHandler>();
+  const mockBus = {
+    subscribe: async (eventType: string, handler: CustomEventHandler) => {
+      subscriptions.set(eventType, handler);
+    },
+    subscribePattern: async () => {},
+  } as unknown as EventBus;
+
+  await setupEventPersistence(mockBus, db);
+  const handler = subscriptions.get('message.received');
+  if (!handler) throw new Error('message.received subscriber was not registered');
   return handler;
 }
 
@@ -404,7 +422,177 @@ postgresDescribe('durable event consumers (#989, real PostgreSQL)', () => {
     });
   });
 
-  describe('opt-in instance scoping + ownership (0080)', () => {
+  describe('opt-in journal readiness gate (waitForReady)', () => {
+    let instanceId: string;
+    let fillHandler: CustomEventHandler;
+    let ingress: NonNullable<ReturnType<typeof createPluginContext>['ingressClaim']>;
+
+    beforeAll(async () => {
+      const [instance] = await db
+        .insert(instances)
+        .values({ name: `inst-journal-ready-${randomUUID()}`, channel: 'whatsapp-baileys' })
+        .returning();
+      if (!instance) throw new Error('instance seed failed');
+      instanceId = instance.id;
+      fillHandler = await captureMessageReceivedHandler(db);
+      const claimer = createPluginContext({ pluginId: 'whatsapp-baileys', eventBus: {} as EventBus, db }).ingressClaim;
+      if (!claimer) throw new Error('ingressClaim missing from plugin context');
+      ingress = claimer;
+    });
+
+    /** A real ingress claim: commits the hollow skeleton row (journal_ready = false). */
+    async function claim(tag: string): Promise<{ id: string; seq: number }> {
+      const id = await ingress.claim({
+        idempotencyKey: `whatsapp-baileys:${instanceId}:jr-${tag}-${randomUUID()}`,
+        instanceId,
+        channelType: 'whatsapp-baileys',
+        externalId: `jr-${tag}`,
+      });
+      if (!id) throw new Error('claim was deduped');
+      const [row] = await db.select().from(omniEvents).where(eq(omniEvents.id, id));
+      if (!row) throw new Error('claim did not commit a row (fail-open path)');
+      expect(row.journalReady).toBe(false);
+      expect(row.rawPayload).toBeNull();
+      return { id, seq: Number(row.journalSeq) };
+    }
+
+    /** The real message.received persistence fill under the claimed id. */
+    async function fill(id: string, tag: string): Promise<void> {
+      await fillHandler({
+        id,
+        type: 'message.received',
+        timestamp: Date.now(),
+        payload: {
+          externalId: `jr-${tag}`,
+          chatId: 'jr-chat@s.whatsapp.net',
+          from: 'jr-sender@s.whatsapp.net',
+          content: { type: 'text', text: `hello ${tag}` },
+          rawPayload: { kind: 'jr', tag },
+        },
+        metadata: { correlationId: id, instanceId, channelType: 'whatsapp-baileys' },
+      });
+      const [row] = await db.select().from(omniEvents).where(eq(omniEvents.id, id));
+      expect(row?.journalReady).toBe(true);
+    }
+
+    test('(a) no flag: a pull between claim and fill returns the hollow row and moves the cursor exactly as today', async () => {
+      const plain = await service.create({ name: 'jr-nogate', eventType: 'message.received' });
+      const filtered = await service.create({
+        name: 'jr-nogate-filtered',
+        eventType: 'message.received',
+        filters: [{ field: 'kind', operator: 'eq', value: 'jr' }],
+      });
+      expect(plain.waitForReady).toBe(false);
+      expect((await service.getByName('jr-nogate-filtered')).waitForReady).toBe(false);
+      const { id, seq } = await claim('a');
+
+      // Unfiltered: the hollow skeleton row is delivered; the returned cursor covers it, the stored cursor waits for ack.
+      const page = await service.pull('jr-nogate', { limit: 10 });
+      expect(page.items.map((e) => e.id)).toEqual([id]);
+      expect(page.items[0]?.rawPayload).toBeNull();
+      expect(page.items[0]?.journalReady).toBe(false);
+      expect(page.cursor).toBe(seq);
+      expect((await service.getByName('jr-nogate')).cursor).toBe(plain.cursor);
+
+      // Filtered: the hollow row fails the payload filter and the cursor is advanced past it (#1128), as today.
+      const dropped = await service.pull('jr-nogate-filtered', { limit: 10 });
+      expect(dropped.items).toEqual([]);
+      expect(dropped.cursor).toBe(seq);
+      expect((await service.getByName('jr-nogate-filtered')).cursor).toBe(seq);
+      expect(filtered.cursor).toBeLessThan(seq);
+      await fill(id, 'a');
+    });
+
+    test('(b) waitForReady=true: a claimed row is held, the cursor stays before it, and the filled row is delivered', async () => {
+      const gated = await service.create({ name: 'jr-gate', eventType: 'message.received', waitForReady: true });
+      await service.create({
+        name: 'jr-gate-filtered',
+        eventType: 'message.received',
+        filters: [{ field: 'kind', operator: 'eq', value: 'jr' }],
+        waitForReady: true,
+      });
+      expect(gated.waitForReady).toBe(true);
+      expect((await service.inspect('jr-gate')).waitForReady).toBe(true);
+      const { id, seq } = await claim('b');
+
+      const held = await service.pull('jr-gate', { limit: 10 });
+      expect(held.items).toEqual([]);
+      expect(held.cursor).toBe(gated.cursor);
+      expect(held.cursor).toBeLessThan(seq);
+      expect((await service.getByName('jr-gate')).cursor).toBe(gated.cursor);
+      const heldFiltered = await service.pull('jr-gate-filtered', { limit: 10 });
+      expect(heldFiltered.items).toEqual([]);
+      expect((await service.getByName('jr-gate-filtered')).cursor).toBeLessThan(seq);
+
+      await fill(id, 'b');
+
+      const page = await service.pull('jr-gate', { limit: 10 });
+      expect(page.items.map((e) => e.id)).toEqual([id]);
+      expect(page.items[0]?.journalReady).toBe(true);
+      expect(page.items[0]?.rawPayload).toEqual({ kind: 'jr', tag: 'b' });
+      expect(page.items[0]?.textContent).toBe('hello b');
+      expect(page.cursor).toBe(seq);
+      const filteredPage = await service.pull('jr-gate-filtered', { limit: 10 });
+      expect(filteredPage.items.map((e) => e.id)).toEqual([id]);
+    });
+
+    test('(c) waitForReady=true: a not-ready row older than the settle window is delivered', async () => {
+      await service.create({ name: 'jr-gate-stale', eventType: 'message.received', waitForReady: true });
+      const { id, seq } = await claim('c');
+      await db
+        .update(omniEvents)
+        .set({ receivedAt: new Date(Date.now() - 60_000) })
+        .where(eq(omniEvents.id, id));
+
+      const page = await service.pull('jr-gate-stale', { limit: 10 });
+      expect(page.items.map((e) => e.id)).toEqual([id]);
+      expect(page.items[0]?.journalReady).toBe(false);
+      expect(page.cursor).toBe(seq);
+    });
+
+    test('(d) waitForReady=true: a long-poll whose page is truncated to empty keeps waiting', async () => {
+      const gated = await service.create({ name: 'jr-gate-wait', eventType: 'message.received', waitForReady: true });
+      await claim('d');
+
+      const started = Date.now();
+      const page = await service.pull('jr-gate-wait', { limit: 10, waitMs: 1200 });
+      expect(Date.now() - started).toBeGreaterThanOrEqual(1000);
+      expect(page.items).toEqual([]);
+      expect(page.cursor).toBe(gated.cursor);
+      expect((await service.getByName('jr-gate-wait')).cursor).toBe(gated.cursor);
+    });
+
+    test('(e) shared + waitForReady=true: no fresh lease spans a held row; the filled row is leased', async () => {
+      const shared = await service.create({
+        name: 'jr-gate-shared',
+        eventType: 'message.received',
+        shared: true,
+        waitForReady: true,
+      });
+      const { id, seq } = await claim('e');
+
+      const held = await service.pull('jr-gate-shared', { limit: 10 });
+      expect(held.items).toEqual([]);
+      expect(held.leaseId).toBeUndefined();
+      expect(held.cursor).toBe(shared.cursor);
+      const state = (await service.getByName('jr-gate-shared')).leaseState;
+      expect(state?.claimed).toBe(shared.cursor);
+      expect(state?.claimed).toBeLessThan(seq);
+      expect(state?.leases).toEqual([]);
+
+      await fill(id, 'e');
+
+      const page = await service.pull('jr-gate-shared', { limit: 10 });
+      expect(page.items.map((e) => e.id)).toEqual([id]);
+      expect(page.items[0]?.journalReady).toBe(true);
+      expect(page.cursor).toBe(seq);
+      if (!page.leaseId) throw new Error('leaseId missing');
+      const acked = await service.ack('jr-gate-shared', 0, page.leaseId);
+      expect(acked.cursor).toBe(seq);
+    });
+  });
+
+  describe('opt-in instance scoping + ownership (0082)', () => {
     // Own instances (omni_events.instance_id is an FK): seeded on the superuser
     // handle BEFORE the two-tenant block below turns on RLS enforcement.
     let instA: string;
@@ -426,7 +614,7 @@ postgresDescribe('durable event consumers (#989, real PostgreSQL)', () => {
         .values({
           channel: 'internal',
           instanceId,
-          eventType: `custom.dc0080.${label}`,
+          eventType: `custom.dc0082.${label}`,
           direction: 'internal',
           status: 'completed',
           rawPayload: { label },
@@ -440,21 +628,21 @@ postgresDescribe('durable event consumers (#989, real PostgreSQL)', () => {
       const seeded = await db
         .insert(instances)
         .values([
-          { name: 'inst-a-0080', channel: 'whatsapp-baileys' as const },
-          { name: 'inst-b-0080', channel: 'whatsapp-baileys' as const },
+          { name: 'inst-a-0082', channel: 'whatsapp-baileys' as const },
+          { name: 'inst-b-0082', channel: 'whatsapp-baileys' as const },
         ])
         .returning({ id: instances.id, name: instances.name });
-      const a = seeded.find((i) => i.name === 'inst-a-0080')?.id;
-      const b = seeded.find((i) => i.name === 'inst-b-0080')?.id;
+      const a = seeded.find((i) => i.name === 'inst-a-0082')?.id;
+      const b = seeded.find((i) => i.name === 'inst-b-0082')?.id;
       if (!a || !b) throw new Error('instance seed failed');
       instA = a;
       instB = b;
       owner = { keyId: randomUUID(), instanceIds: [instA] };
       otherRestricted = { keyId: randomUUID(), instanceIds: [instA] };
 
-      await service.create({ name: 'legacy-0080', eventType: 'custom.dc0080.*', startFrom: 'beginning' }, owner);
+      await service.create({ name: 'legacy-0082', eventType: 'custom.dc0082.*', startFrom: 'beginning' }, owner);
       await service.create(
-        { name: 'scoped-0080', eventType: 'custom.dc0080.*', startFrom: 'beginning', scoped: true },
+        { name: 'scoped-0082', eventType: 'custom.dc0082.*', startFrom: 'beginning', scoped: true },
         owner,
       );
       for (const [label, instance] of [
@@ -470,81 +658,81 @@ postgresDescribe('durable event consumers (#989, real PostgreSQL)', () => {
     });
 
     test('no new option: identical behaviour — an unscoped consumer is global for every key', async () => {
-      const stored = await service.getByName('legacy-0080');
+      const stored = await service.getByName('legacy-0082');
       expect([stored.scoped, stored.instanceIds, stored.ownerKeyId]).toEqual([false, null, null]);
-      expect(published.find((p) => p.payload.name === 'legacy-0080')?.payload).not.toHaveProperty('scoped');
+      expect(published.find((p) => p.payload.name === 'legacy-0082')?.payload).not.toHaveProperty('scoped');
 
       for (const caller of [owner, otherRestricted, unrestricted, undefined]) {
-        expect((await service.inspect('legacy-0080', caller)).name).toBe('legacy-0080');
-        expect((await service.list(caller)).map((c) => c.name)).toContain('legacy-0080');
+        expect((await service.inspect('legacy-0082', caller)).name).toBe('legacy-0082');
+        expect((await service.list(caller)).map((c) => c.name)).toContain('legacy-0082');
         // Every instance's rows (and instance-less rows) — the key's restriction does not apply.
-        const page = await service.pull('legacy-0080', { limit: 100 }, caller);
+        const page = await service.pull('legacy-0082', { limit: 100 }, caller);
         expect(page.items.map((e) => e.id)).toEqual(['a1', 'b1', 'none', 'b2', 'a2', 'b3'].map(idOf));
       }
-      const page = await service.pull('legacy-0080', { limit: 2 }, otherRestricted);
-      expect((await service.ack('legacy-0080', page.cursor, undefined, otherRestricted)).cursor).toBe(page.cursor);
-      await service.delete('legacy-0080', otherRestricted);
-      await expect(service.inspect('legacy-0080')).rejects.toThrow(/not found/i);
+      const page = await service.pull('legacy-0082', { limit: 2 }, otherRestricted);
+      expect((await service.ack('legacy-0082', page.cursor, undefined, otherRestricted)).cursor).toBe(page.cursor);
+      await service.delete('legacy-0082', otherRestricted);
+      await expect(service.inspect('legacy-0082')).rejects.toThrow(/not found/i);
     });
 
     test('a scoped create naming an instance that does not exist is refused (400) and stores nothing', async () => {
       const missing = randomUUID();
       const refused = service.create(
-        { name: 'scoped-0080-missing', eventType: 'custom.dc0080.*', scoped: true, instanceIds: [instA, missing] },
+        { name: 'scoped-0082-missing', eventType: 'custom.dc0082.*', scoped: true, instanceIds: [instA, missing] },
         unrestricted,
       );
       await expect(refused).rejects.toMatchObject({ code: 'VALIDATION', context: { instanceIds: [missing] } });
-      await expect(service.getByName('scoped-0080-missing')).rejects.toThrow(/not found/i);
+      await expect(service.getByName('scoped-0082-missing')).rejects.toThrow(/not found/i);
     });
 
     test('scoped create stores the owner key and the restricted key instances', async () => {
-      const stored = await service.inspect('scoped-0080', owner);
+      const stored = await service.inspect('scoped-0082', owner);
       expect(stored.scoped).toBe(true);
       expect(stored.instanceIds).toEqual([instA]);
       expect(stored.ownerKeyId).toBe(owner.keyId);
     });
 
     test("scoped pull pages only its instances' rows and the cursor moves past filtered rows", async () => {
-      const first = await service.pull('scoped-0080', { limit: 1 }, owner);
+      const first = await service.pull('scoped-0082', { limit: 1 }, owner);
       expect(first.items.map((e) => e.id)).toEqual([idOf('a1')]);
-      await service.ack('scoped-0080', first.cursor, undefined, owner);
+      await service.ack('scoped-0082', first.cursor, undefined, owner);
 
       // b1, none, b2 are skipped in SQL: the next 1-row page is a2.
-      const second = await service.pull('scoped-0080', { limit: 1 }, owner);
+      const second = await service.pull('scoped-0082', { limit: 1 }, owner);
       expect(second.items.map((e) => e.id)).toEqual([idOf('a2')]);
       expect(second.items.every((e) => e.instanceId === instA)).toBe(true);
-      await service.ack('scoped-0080', second.cursor, undefined, owner);
+      await service.ack('scoped-0082', second.cursor, undefined, owner);
 
       // Only b3 (another instance) remains past the cursor: nothing to page, caught up despite lag.
-      const after = await service.pull('scoped-0080', { limit: 100 }, owner);
+      const after = await service.pull('scoped-0082', { limit: 100 }, owner);
       expect(after.items).toEqual([]);
       expect(after.cursor).toBe(second.cursor);
-      const inspected = await service.inspect('scoped-0080', owner);
+      const inspected = await service.inspect('scoped-0082', owner);
       expect(inspected.caughtUp).toBe(true);
       expect(inspected.lag).toBeGreaterThan(0);
     });
 
     test('a non-owner restricted key gets 404 on get/pull/ack/delete and does not see it listed', async () => {
-      await expect(service.inspect('scoped-0080', otherRestricted)).rejects.toThrow(/not found/i);
-      await expect(service.pull('scoped-0080', { limit: 10 }, otherRestricted)).rejects.toThrow(/not found/i);
-      const cursor = (await service.getByName('scoped-0080')).cursor;
-      await expect(service.ack('scoped-0080', cursor + 1000, undefined, otherRestricted)).rejects.toThrow(/not found/i);
-      await expect(service.delete('scoped-0080', otherRestricted)).rejects.toThrow(/not found/i);
-      expect((await service.list(otherRestricted)).map((c) => c.name)).not.toContain('scoped-0080');
+      await expect(service.inspect('scoped-0082', otherRestricted)).rejects.toThrow(/not found/i);
+      await expect(service.pull('scoped-0082', { limit: 10 }, otherRestricted)).rejects.toThrow(/not found/i);
+      const cursor = (await service.getByName('scoped-0082')).cursor;
+      await expect(service.ack('scoped-0082', cursor + 1000, undefined, otherRestricted)).rejects.toThrow(/not found/i);
+      await expect(service.delete('scoped-0082', otherRestricted)).rejects.toThrow(/not found/i);
+      expect((await service.list(otherRestricted)).map((c) => c.name)).not.toContain('scoped-0082');
 
       // Nothing moved: the cursor is untouched and the consumer still exists.
-      expect((await service.getByName('scoped-0080')).cursor).toBe(cursor);
+      expect((await service.getByName('scoped-0082')).cursor).toBe(cursor);
     });
 
     test('the owner and an instance-unrestricted key succeed', async () => {
       for (const caller of [owner, unrestricted]) {
-        expect((await service.inspect('scoped-0080', caller)).ownerKeyId).toBe(owner.keyId);
-        expect((await service.list(caller)).map((c) => c.name)).toContain('scoped-0080');
-        const page = await service.pull('scoped-0080', { limit: 10 }, caller);
-        await service.ack('scoped-0080', page.cursor, undefined, caller);
+        expect((await service.inspect('scoped-0082', caller)).ownerKeyId).toBe(owner.keyId);
+        expect((await service.list(caller)).map((c) => c.name)).toContain('scoped-0082');
+        const page = await service.pull('scoped-0082', { limit: 10 }, caller);
+        await service.ack('scoped-0082', page.cursor, undefined, caller);
       }
-      await service.delete('scoped-0080', unrestricted);
-      await expect(service.inspect('scoped-0080', owner)).rejects.toThrow(/not found/i);
+      await service.delete('scoped-0082', unrestricted);
+      await expect(service.inspect('scoped-0082', owner)).rejects.toThrow(/not found/i);
     });
   });
 

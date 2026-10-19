@@ -566,7 +566,21 @@
       "idx": 80,
       "version": "7",
       "when": 1788000000000,
-      "tag": "0080_durable_consumers_instance_scope",
+      "tag": "0080_event_journal_ready",
+      "breakpoints": true
+    },
+    {
+      "idx": 81,
+      "version": "7",
+      "when": 1788100000000,
+      "tag": "0081_instances_outbound_pacing",
+      "breakpoints": true
+    },
+    {
+      "idx": 82,
+      "version": "7",
+      "when": 1788200000000,
+      "tag": "0082_durable_consumers_instance_scope",
       "breakpoints": true
     }
   ]

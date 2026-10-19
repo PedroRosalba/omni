@@ -31,7 +31,7 @@
  * updated compare-and-set, so concurrent pullers on any replica never share
  * a page.
  *
- * Instance scoping (opt-in, 0080): a consumer created with `scoped: true`
+ * Instance scoping (opt-in, 0082): a consumer created with `scoped: true`
  * stores its owner key and an instance set. Its pull only pages journal rows
  * of those instances (in SQL, inside the same scan, so the scanned cursor and
  * the empty-page advance still move past filtered rows), and only the owner
@@ -70,11 +70,16 @@ export interface CreateConsumerInput {
   startFrom?: ConsumerStartFrom;
   /** Competing consumers: pullers on this name split the stream (#1188). Default false = fan-out. */
   shared?: boolean;
-  /** Opt-in instance scoping + ownership (0080). Default false = today's global consumer. */
+  /**
+   * Opt-in journal readiness gate: hold claimed-but-unfilled rows (younger
+   * than the settle window) instead of delivering them hollow. Default false.
+   */
+  waitForReady?: boolean;
+  /** Opt-in instance scoping + ownership (0082). Default false = today's global consumer. */
   scoped?: boolean;
   /**
    * Scoped consumers only: instance UUIDs to page (validated there). Ignored
-   * without `scoped: true`, as an unknown field was before 0080.
+   * without `scoped: true`, as an unknown field was before 0082.
    */
   instanceIds?: unknown;
 }
@@ -142,6 +147,37 @@ const PULL_MAX_LIMIT = 500;
 const PULL_MAX_WAIT_MS = 30_000;
 const DEFAULT_LEASE_MS = 60_000;
 const SHARED_CAS_ATTEMPTS = 20;
+/** Default settle window for the opt-in readiness gate (EVENT_CONSUMER_SETTLE_MS). */
+export const DEFAULT_CONSUMER_SETTLE_MS = 5_000;
+
+/**
+ * The readiness gate's settle window: EVENT_CONSUMER_SETTLE_MS when it is a
+ * non-negative number, 5000 ms otherwise. Read per pull, not at load.
+ */
+export function resolveConsumerSettleMs(raw: string | undefined = process.env.EVENT_CONSUMER_SETTLE_MS): number {
+  if (raw === undefined || raw.trim() === '') return DEFAULT_CONSUMER_SETTLE_MS;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_CONSUMER_SETTLE_MS;
+}
+
+/**
+ * Opt-in journal readiness gate. With `waitForReady` false the page is
+ * returned unchanged (today's behaviour). With it true the page is cut just
+ * before the first claimed-but-unfilled row (`journalReady` false) whose
+ * receivedAt is younger than `settleMs`, so neither delivery nor the cursor
+ * moves past it. A not-ready row older than the window counts as ready, so
+ * a fill that never lands cannot stall the consumer.
+ */
+export function truncateAtUnready<T extends Pick<OmniEvent, 'journalReady' | 'receivedAt'>>(
+  page: T[],
+  waitForReady: boolean,
+  settleMs: number,
+  now: number,
+): T[] {
+  if (!waitForReady) return page;
+  const held = page.findIndex((row) => !row.journalReady && now - row.receivedAt.getTime() < settleMs);
+  return held === -1 ? page : page.slice(0, held);
+}
 
 /** Where a shared puller goes next: redeliver an expired lease, or claim new rows after `after`. */
 export function planSharedPull(
@@ -196,7 +232,7 @@ const ScopedInstanceIdsSchema = z.array(z.string().uuid()).max(100).optional();
 
 /**
  * Resolve the scope columns for a create. Unscoped (the default) is exactly
- * the pre-0080 consumer, and any `instanceIds` sent with it is ignored as it
+ * the pre-0082 consumer, and any `instanceIds` sent with it is ignored as it
  * was before (an unknown field). Scoped: the instanceIds must be up to 100
  * UUIDs (400 otherwise); an instance-restricted key gets the
  * requested instances (all of its own when omitted) and may not name an
@@ -394,6 +430,7 @@ export class EventConsumerService {
         filters: input.filters ?? null,
         cursor,
         shared: input.shared ?? false,
+        waitForReady: input.waitForReady ?? false,
         leaseState: input.shared ? { claimed: cursor, leases: [] } : null,
         ...(scope.scoped ? scope : {}),
       })
@@ -457,10 +494,16 @@ export class EventConsumerService {
     if (consumer.shared) return this.pullShared(consumer, limit, waitMs, options.leaseMs ?? DEFAULT_LEASE_MS, caller);
 
     const deadline = Date.now() + waitMs;
-    let scanned = await this.scanPage(consumer, limit);
+    // Readiness gate (opt-in): a page cut to empty keeps long-polling.
+    const settleMs = consumer.waitForReady ? resolveConsumerSettleMs() : 0;
+    const scan = async (): Promise<OmniEvent[]> => {
+      const page = await this.scanPage(consumer, limit);
+      return consumer.waitForReady ? truncateAtUnready(page, true, settleMs, Date.now()) : page;
+    };
+    let scanned = await scan();
     while (scanned.length === 0 && Date.now() < deadline) {
       await new Promise<void>((resolve) => setTimeout(resolve, PULL_POLL_INTERVAL_MS));
-      scanned = await this.scanPage(consumer, limit);
+      scanned = await scan();
     }
 
     const items = scanned.filter((row) => matchesConsumerPayload(row, consumer.filters));
@@ -571,7 +614,7 @@ export class EventConsumerService {
       const plan = planSharedPull(state, now);
       const scanned = plan.reclaim
         ? await this.scanPage(consumer, PULL_MAX_LIMIT, plan.reclaim.from, plan.reclaim.to)
-        : await this.scanPage(consumer, limit, plan.after);
+        : await this.scanFresh(consumer, limit, plan.after);
       const last = scanned[scanned.length - 1];
       if (!plan.reclaim && !last) return { consumer, lease: null, scanned };
 
@@ -628,10 +671,21 @@ export class EventConsumerService {
   }
 
   /**
+   * A fresh shared page after `after`. With the opt-in readiness gate it is
+   * cut before a held row, so a fresh lease never spans one (an expired
+   * lease's reclaim keeps its fixed range and does not come through here).
+   */
+  private async scanFresh(consumer: DurableConsumer, limit: number, after: number): Promise<OmniEvent[]> {
+    const page = await this.scanPage(consumer, limit, after);
+    if (!consumer.waitForReady) return page;
+    return truncateAtUnready(page, true, resolveConsumerSettleMs(), Date.now());
+  }
+
+  /**
    * One ascending journal page after the consumer's cursor, pre-filtered by
    * the type filter in SQL (exact match, or trailing-* prefix glob — the
    * EventService.list / #966 contract) minus the exclude globs (#1078).
-   * A scoped consumer (0080) also keeps only its instances' rows — in the
+   * A scoped consumer (0082) also keeps only its instances' rows — in the
    * same query, so the page's last row (the scanned cursor) is a row it may
    * see, and the empty-page advance skips other instances' rows.
    */

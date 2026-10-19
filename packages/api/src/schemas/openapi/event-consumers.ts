@@ -39,6 +39,11 @@ export const DurableConsumerSchema = z.object({
   shared: z.boolean().openapi({
     description: 'true = competing consumers (pullers on this name split the stream); false = own cursor (fan-out)',
   }),
+  waitForReady: z.boolean().openapi({
+    description:
+      'true = opt-in journal readiness gate: claimed-but-unfilled rows are held (not delivered, cursor not moved ' +
+      "past them) until filled or older than the settle window; false = today's behaviour",
+  }),
   scoped: z.boolean().openapi({
     description:
       'true = instance-scoped consumer (opt-in): pulls only its instanceIds, visible only to its owner key and to ' +
@@ -97,6 +102,15 @@ export const CreateConsumerSchema = z.object({
         'event. true = N pullers on THIS name split the stream: each pull leases a page to one puller, ack(leaseId) ' +
         'releases it, an unacked lease is redelivered after leaseMs (at-least-once).',
     }),
+  waitForReady: z
+    .boolean()
+    .optional()
+    .openapi({
+      description:
+        "Opt-in journal readiness gate. false (default) = today's behaviour: a row claimed at ingress but not yet " +
+        'filled is delivered as it is. true = pull and shared claims stop before such a row (journalReady false) ' +
+        'until it is filled or older than the settle window (EVENT_CONSUMER_SETTLE_MS, default 5000 ms).',
+    }),
   scoped: z
     .boolean()
     .optional()
@@ -106,7 +120,7 @@ export const CreateConsumerSchema = z.object({
         'consumer is owned by the calling API key and pulls only journal rows of its instanceIds; only the owner ' +
         'key or an instance-unrestricted key can inspect, pull, ack, delete or list it (others get 404).',
     }),
-  // Typed loosely on purpose: before 0080 an unknown `instanceIds` was stripped, so a legacy client that
+  // Typed loosely on purpose: before 0082 an unknown `instanceIds` was stripped, so a legacy client that
   // sends one (any shape) without `scoped: true` must keep being accepted and ignored. The service
   // validates it (array of up to 100 UUIDs) only for scoped consumers.
   instanceIds: z
