@@ -16,11 +16,12 @@
 -- cascade into (or block deleting) the consumer row; an orphaned scoped
 -- consumer stays reachable by instance-unrestricted keys.
 --
--- Numbering: open PRs #1294, #1295, #1299 and #1300 also add a 0080
--- migration. Agreed merge order: #1294, #1295, #1298 (this one), #1299; each
--- later PR renumbers its OWN migration when it merges (rename, journal
--- idx/tag, `when` above the previous entry) per the parallel-worktree rule in
--- .claude/CLAUDE.md.
+-- Numbering: open PRs #1294, #1295, #1300 and #1297 also add a 0080
+-- migration, and #1299 adds 0081_event_access_decision (stacked on #1294).
+-- Agreed merge order: #1294 (0080), #1295 (0081), #1298 (this one, 0082),
+-- #1299 (0083), #1300 (0084), #1297 (0085); each later PR renumbers its OWN
+-- migration when it merges (rename, journal idx/tag, `when` above the previous
+-- entry) per the parallel-worktree rule in .claude/CLAUDE.md.
 --
 -- Hand-written following the 0043/0044/0052 precedent (additive, idempotent).
 -- No explicit BEGIN/COMMIT — the boot migrator executes this file on a pooled
