@@ -120,6 +120,10 @@ export const InstanceSchema = z.object({
       "WhatsApp (Baileys) pairing identity: 'desktop' (macOS Desktop + group history) or 'web' (Ubuntu/Chrome)",
   }),
   syncFullHistory: z.boolean().openapi({ description: 'WhatsApp (Baileys): request full history on connect' }),
+  audioTranscription: z.enum(['auto', 'off']).openapi({
+    description:
+      "Server-side transcription of inbound audio: 'auto' (transcribed as always) or 'off' (stored but never sent to STT)",
+  }),
   ownerIdentifier: z.string().nullable().openapi({ description: 'Owner identifier' }),
   agentId: z.string().uuid().nullable().optional().openapi({ description: 'Agent UUID (agents table)' }),
   agentProviderId: z
@@ -170,6 +174,10 @@ export const CreateInstanceSchema = z.object({
     .boolean()
     .default(false)
     .openapi({ description: 'WhatsApp (Baileys): request full message history on connect (default: false)' }),
+  audioTranscription: z.enum(['auto', 'off']).default('auto').openapi({
+    description:
+      "Server-side transcription of inbound audio (default: auto). 'auto' = transcribed as always; 'off' = stored but never sent to STT, and a skipped media.processed is emitted instead",
+  }),
   gupshupHandoffOptions: GupshupHandoffOptionsSchema.nullable()
     .optional()
     .openapi({

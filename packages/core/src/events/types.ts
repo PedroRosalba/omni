@@ -401,6 +401,13 @@ export interface MediaProcessedPayload {
   tokensUsed?: number;
   /** Set when processing failed — content will be empty string */
   error?: string;
+  /**
+   * Set when processing was deliberately not run (not a failure) — content will
+   * be empty string and `error` absent. Additive: absent on every other event.
+   */
+  skipped?: boolean;
+  /** Why processing was skipped, e.g. 'transcription_off'. Only set with `skipped`. */
+  reason?: string;
 }
 
 export interface MediaProcessingFailedPayload {

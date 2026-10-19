@@ -1005,6 +1005,17 @@ export const instances = pgTable(
     processVideo: boolean('process_video').notNull().default(true),
     processDocuments: boolean('process_documents').notNull().default(true),
 
+    // ---- Audio Transcription ----
+    /**
+     * Opt-in switch for server-side transcription of inbound audio: 'auto'
+     * (default, today's behaviour) or 'off' (audio is stored but never sent to
+     * STT). Read by the media processor; process_audio above stays unread.
+     */
+    audioTranscription: varchar('audio_transcription', { length: 10 })
+      .notNull()
+      .default('auto')
+      .$type<'auto' | 'off'>(),
+
     // ---- Agent Media Preprocessing ----
     /** Wait for media processing (transcription/vision) before dispatching to agent */
     agentWaitForMedia: boolean('agent_wait_for_media').notNull().default(true),

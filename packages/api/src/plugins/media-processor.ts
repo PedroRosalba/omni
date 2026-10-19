@@ -565,6 +565,55 @@ function getPromptOverride(ctx: MediaProcessorContext, contentType: string | und
 }
 
 /**
+ * Read the instance's audio transcription switch. Anything other than an
+ * explicit 'off' — a missing service, a missing instance, a lookup that throws,
+ * an unset or unknown value — answers 'auto', so the default path is today's.
+ * The legacy `process_audio` column is deliberately not consulted: nothing ever
+ * honoured it, so lines carrying `false` there keep being transcribed.
+ */
+async function readAudioTranscriptionMode(
+  ctx: MediaProcessorContext,
+  instanceId: string,
+  trustedTenantId: string | undefined,
+): Promise<'auto' | 'off'> {
+  try {
+    const instancesService = ctx.services?.instances;
+    if (!instancesService) return 'auto';
+    const instance = await runMediaDb(ctx, trustedTenantId, () => instancesService.getById(instanceId));
+    return instance?.audioTranscription === 'off' ? 'off' : 'auto';
+  } catch (error) {
+    log.debug('Audio transcription mode lookup failed, transcribing as usual', { instanceId, error: String(error) });
+    return 'auto';
+  }
+}
+
+/**
+ * Report a deliberately skipped transcription (audioTranscription 'off') with
+ * the same completion event a finished item emits, so a dispatcher waiting on
+ * the message is released at once. Not a failure: no media.processing.failed,
+ * no `error` field and no `[error` marker on the message row.
+ */
+async function publishTranscriptionSkipped(
+  ctx: MediaProcessorContext,
+  messageId: string,
+  metadata: { instanceId: string; eventId?: string; channelType?: ChannelType },
+): Promise<void> {
+  log.info('Audio transcription off for instance, skipping STT', { messageId, instanceId: metadata.instanceId });
+  await ctx.eventBus.publish(
+    'media.processed',
+    {
+      eventId: metadata.eventId ?? messageId,
+      mediaId: messageId,
+      processingType: 'transcription',
+      content: '',
+      skipped: true,
+      reason: 'transcription_off',
+    },
+    { instanceId: metadata.instanceId, channelType: metadata.channelType },
+  );
+}
+
+/**
  * Process media for a received message
  */
 async function processMessageMedia(
@@ -601,6 +650,15 @@ async function processMessageMedia(
     trustedTenantId,
   );
   if (!media) return;
+
+  // Opt-in per-instance switch (instances.audio_transcription): with 'off' the
+  // audio stays stored (resolved above) but never reaches an STT provider.
+  // Every other value — including every instance that never set it — keeps
+  // today's path below.
+  if (content.type === 'audio' && (await readAudioTranscriptionMode(ctx, instanceId, trustedTenantId)) === 'off') {
+    await publishTranscriptionSkipped(ctx, media.messageId, metadata);
+    return;
+  }
 
   // Obtain a readable local path for the bytes. In remote mode this fetches the
   // S3 object into a temp file; in local mode it resolves the on-disk path.

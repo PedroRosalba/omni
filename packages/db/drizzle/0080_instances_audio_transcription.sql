@@ -1,0 +1,25 @@
+-- Per-instance opt-in switch for server-side transcription of inbound audio.
+--
+-- The media processor sends every inbound audio message (voice notes included)
+-- to an STT provider. Some instances do not want that transcription or its STT
+-- spend, and there was no way to turn it off per instance:
+--
+--   instances.audio_transcription  varchar(10) NOT NULL DEFAULT 'auto'
+--     'auto' = today's behaviour (audio is transcribed)
+--     'off'  = audio is still stored and downloadable, but never sent to STT;
+--              the processor emits a skipped media.processed instead
+--
+-- The DEFAULT backfills every existing row with 'auto', so no deployment,
+-- instance or consumer changes behaviour until an operator opts in. The legacy
+-- process_audio column is deliberately left unread: nothing ever honoured it,
+-- so rows carrying process_audio = false keep being transcribed as before.
+--
+-- Numbering: other open PRs also claim 0080. Per the parallel-worktree rule,
+-- whichever merges second renumbers its own migration (file name, journal
+-- idx/tag, and a `when` above the new previous entry).
+--
+-- Hand-written following the 0043/0044/0052 precedent (additive, idempotent).
+-- No explicit BEGIN/COMMIT — the boot migrator executes this file on a pooled
+-- postgres-js connection, which rejects raw transaction control.
+
+ALTER TABLE "instances" ADD COLUMN IF NOT EXISTS "audio_transcription" varchar(10) DEFAULT 'auto' NOT NULL;
