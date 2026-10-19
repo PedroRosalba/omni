@@ -478,6 +478,35 @@ describe('WhatsAppPlugin.holdPresence', () => {
       expect(presences(calls)).toHaveLength(0);
     });
 
+    it("a reaction rejected by validation (all-digit emoji) still ends the hold with 'paused'", async () => {
+      const { plugin, calls, internals, sock } = createPlugin();
+      await plugin.holdPresence(INSTANCE_ID, PHONE, 'typing');
+
+      const rejected = await plugin.sendMessage(INSTANCE_ID, {
+        ...immediateReaction(PHONE),
+        content: { type: 'reaction', targetMessageId: '3EB0HELDTARGET', emoji: '123456789' },
+      });
+
+      expect(rejected.success).toBe(false);
+      expect(sock.sendMessage).not.toHaveBeenCalled();
+      expect(internals.presenceHolds.size).toBe(0);
+      expect(calls.at(-1)).toEqual(['presence', 'paused', PHONE_JID]);
+      await advance(60_000);
+      expect(presences(calls, 'composing')).toHaveLength(1);
+    });
+
+    it('a rejected reaction with no hold active emits no presence update', async () => {
+      const { plugin, calls } = createPlugin();
+
+      const rejected = await plugin.sendMessage(INSTANCE_ID, {
+        ...immediateReaction(PHONE),
+        content: { type: 'reaction', targetMessageId: '3EB0HELDTARGET', emoji: '123456789' },
+      });
+
+      expect(rejected.success).toBe(false);
+      expect(presences(calls)).toHaveLength(0);
+    });
+
     it('a send that fails in preprocessOutgoing still ends the hold', async () => {
       const { plugin, calls, internals } = createPlugin();
       await plugin.holdPresence(INSTANCE_ID, PHONE, 'typing');

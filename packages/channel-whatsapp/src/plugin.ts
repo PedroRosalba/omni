@@ -1773,6 +1773,11 @@ export class WhatsAppPlugin extends BaseChannelPlugin {
     jid: string,
     message: OutgoingMessage,
   ): Promise<SendResult> {
+    // Any reaction attempt to the chat ends a server-held presence on it — a
+    // reaction rejected below included, so the hold never keeps refreshing.
+    // No-op when no hold is active.
+    await this.releasePresenceHoldForSend(instanceId, sock, jid);
+
     const { targetMessageId, emoji } = message.content;
 
     if (!targetMessageId) {
@@ -1818,9 +1823,6 @@ export class WhatsAppPlugin extends BaseChannelPlugin {
       fromMe,
       targetParticipant,
     });
-
-    // A server-held presence on this chat ends as the reaction goes out.
-    await this.releasePresenceHoldForSend(instanceId, sock, jid);
 
     const correlationId = message.metadata?.correlationId as string | undefined;
     correlationId && this.captureT10(correlationId);
