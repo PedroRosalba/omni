@@ -565,25 +565,32 @@ function getPromptOverride(ctx: MediaProcessorContext, contentType: string | und
 }
 
 /**
- * Read the instance's audio transcription switch. Anything other than an
- * explicit 'off' — a missing service, a missing instance, a lookup that throws,
- * an unset or unknown value — answers 'auto', so the default path is today's.
- * The legacy `process_audio` column is deliberately not consulted: nothing ever
- * honoured it, so lines carrying `false` there keep being transcribed.
- */
-/**
  * Per-instance cache of the audioTranscription mode only (no credentials), so
  * the default 'auto' path costs about one instance read per instance per TTL
  * instead of one per audio message. A changed setting applies within the TTL.
+ *
+ * The last mode successfully read is also kept past its TTL, so a lookup that
+ * throws later never flips a known 'off' instance back to transcription.
  */
 const AUDIO_TRANSCRIPTION_MODE_TTL_MS = 30_000;
-const audioTranscriptionModeCache = new Map<string, { mode: 'auto' | 'off'; expiresAt: number }>();
+type AudioTranscriptionMode = 'auto' | 'off';
+const audioTranscriptionModeCache = new Map<string, { mode: AudioTranscriptionMode; expiresAt: number }>();
+const lastKnownAudioTranscriptionMode = new Map<string, AudioTranscriptionMode>();
 
+/**
+ * Read the instance's audio transcription switch. Anything other than an
+ * explicit 'off' — a missing service, a missing instance, an unset or unknown
+ * value — answers 'auto', so the default path is today's. A lookup that throws
+ * answers the last mode read for the instance (a known 'off' stays off) and
+ * 'auto' only when the mode was never read.
+ * The legacy `process_audio` column is deliberately not consulted: nothing ever
+ * honoured it, so lines carrying `false` there keep being transcribed.
+ */
 async function readAudioTranscriptionMode(
   ctx: MediaProcessorContext,
   instanceId: string,
   trustedTenantId: string | undefined,
-): Promise<'auto' | 'off'> {
+): Promise<AudioTranscriptionMode> {
   const cacheKey = `${trustedTenantId ?? ''}:${instanceId}`;
   const cached = audioTranscriptionModeCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) return cached.mode;
@@ -591,12 +598,19 @@ async function readAudioTranscriptionMode(
     const instancesService = ctx.services?.instances;
     if (!instancesService) return 'auto';
     const instance = await runMediaDb(ctx, trustedTenantId, () => instancesService.getById(instanceId));
-    const mode = instance?.audioTranscription === 'off' ? 'off' : 'auto';
+    const mode: AudioTranscriptionMode = instance?.audioTranscription === 'off' ? 'off' : 'auto';
     audioTranscriptionModeCache.set(cacheKey, { mode, expiresAt: Date.now() + AUDIO_TRANSCRIPTION_MODE_TTL_MS });
+    lastKnownAudioTranscriptionMode.set(cacheKey, mode);
     return mode;
   } catch (error) {
-    log.debug('Audio transcription mode lookup failed, transcribing as usual', { instanceId, error: String(error) });
-    return 'auto';
+    const lastKnown = lastKnownAudioTranscriptionMode.get(cacheKey);
+    log.debug('Audio transcription mode lookup failed, using the last known mode', {
+      instanceId,
+      mode: lastKnown ?? 'auto',
+      lastKnown: lastKnown !== undefined,
+      error: String(error),
+    });
+    return lastKnown ?? 'auto';
   }
 }
 
@@ -983,7 +997,10 @@ export async function setupMediaProcessor(eventBus: EventBus, db: Database, serv
 
 export const __test__ = {
   buildFetchOptions,
-  resetAudioTranscriptionModeCache: () => audioTranscriptionModeCache.clear(),
+  resetAudioTranscriptionModeCache: () => {
+    audioTranscriptionModeCache.clear();
+    lastKnownAudioTranscriptionMode.clear();
+  },
   persistProcessingResult,
   resolveSafeMediaContentEventId,
   processMessageMedia,

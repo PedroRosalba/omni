@@ -3,7 +3,9 @@
  *
  * - No new option set (including a line carrying the legacy process_audio=false,
  *   which nothing ever honoured) → audio is transcribed exactly as today.
- * - 'auto', a missing/throwing instance lookup → today's path.
+ * - 'auto', a missing instance, or a throwing lookup on a never-read instance
+ *   → today's path. A lookup that throws after a successful read keeps the last
+ *   known mode, so a known 'off' instance stays off.
  * - 'off' → the audio is still stored, but never sent to STT; one skipped
  *   media.processed (content '', skipped: true, reason 'transcription_off') is
  *   published and no media.processing.failed.
@@ -12,7 +14,7 @@
  * DB-free: every collaborator of processMessageMedia is mocked.
  */
 
-import { afterEach, beforeEach, describe, expect, it, mock } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, it, mock, setSystemTime } from 'bun:test';
 import type { EventBus, MessageReceivedPayload } from '@omni/core';
 import type { Database } from '@omni/db';
 import type { MediaProcessingService } from '@omni/media-processing';
@@ -133,7 +135,10 @@ function payloadFor(type: 'audio' | 'image', mimeType: string): MessageReceivedP
 
 // The mode cache is module state: keep it from leaking between tests or into other files.
 beforeEach(() => __test__.resetAudioTranscriptionModeCache());
-afterEach(() => __test__.resetAudioTranscriptionModeCache());
+afterEach(() => {
+  __test__.resetAudioTranscriptionModeCache();
+  setSystemTime();
+});
 
 const audioPayload = payloadFor('audio', 'audio/ogg');
 const imagePayload = payloadFor('image', 'image/jpeg');
@@ -173,7 +178,7 @@ describe('audio transcription switch — no new option: identical behaviour', ()
     expectTranscribedAsToday(h);
   });
 
-  it('transcribes audio when the instance lookup throws', async () => {
+  it('transcribes audio when the lookup throws for an instance never read before', async () => {
     const h = makeHarness('throw');
     await run(h, audioPayload);
     expect(h.getById).toHaveBeenCalledTimes(1);
@@ -246,5 +251,44 @@ describe('audioTranscription mode cache', () => {
     await run(h, audioPayload);
     await run(h, audioPayload);
     expect(h.getById).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('audioTranscription mode — lookup fails after the TTL expired', () => {
+  const T0 = new Date('2026-10-19T12:00:00Z');
+  const AFTER_TTL = new Date(T0.getTime() + 31_000);
+
+  async function readThenFailAfterTtl(h: Harness) {
+    setSystemTime(T0);
+    await run(h, audioPayload);
+    h.getById.mockImplementation(async () => {
+      throw new Error('instance lookup exploded');
+    });
+    setSystemTime(AFTER_TTL);
+    h.published.length = 0;
+    h.process.mockClear();
+    h.materialize.mockClear();
+    h.storeFromUrl.mockClear();
+    await run(h, audioPayload);
+    expect(h.getById).toHaveBeenCalledTimes(2);
+  }
+
+  it("keeps a known 'off' instance off: no STT, one skipped media.processed", async () => {
+    const h = makeHarness({ id: INSTANCE_ID, audioTranscription: 'off' });
+    await readThenFailAfterTtl(h);
+
+    expect(h.storeFromUrl).toHaveBeenCalledTimes(1);
+    expect(h.materialize).not.toHaveBeenCalled();
+    expect(h.process).not.toHaveBeenCalled();
+    const processed = ofType(h, 'media.processed');
+    expect(processed).toHaveLength(1);
+    expect(processed[0]?.payload).toMatchObject({ skipped: true, reason: 'transcription_off', content: '' });
+    expect(ofType(h, 'media.processing.failed')).toHaveLength(0);
+  });
+
+  it("keeps a known 'auto' instance transcribing", async () => {
+    const h = makeHarness({ id: INSTANCE_ID, audioTranscription: 'auto' });
+    await readThenFailAfterTtl(h);
+    expectTranscribedAsToday(h);
   });
 });
