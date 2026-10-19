@@ -27,6 +27,9 @@
  * `reconnect` event carrying an SSE `retry:` hint, and the client reconnects
  * with Last-Event-ID, which re-runs auth, scopes and tenancy. That bounds a
  * revoked key or a suspended tenant for legacy and tenant credentials alike.
+ * The `reconnect` event's `id:` is the SCANNED position (every row up to it
+ * was sent or filtered out), not the last row sent, so a sparse consumer on a
+ * busy journal resumes past the non-matching rows instead of re-scanning them.
  */
 
 import { NotFoundError, STREAM_CONFIGS, ValidationError } from '@omni/core';
@@ -254,8 +257,12 @@ export interface ConsumerStreamOptions {
   heartbeat: () => Promise<void>;
   /** End the stream with a final error event (consumer deleted or no longer streamable). */
   close: (error: Error) => Promise<void>;
-  /** End the stream with a final `reconnect` event (lifetime reached or server shutdown). */
-  expire: (reason: StreamEndReason) => Promise<void>;
+  /**
+   * End the stream with a final `reconnect` event (lifetime reached or server
+   * shutdown). `position` is the resume point for its SSE `id:`: every row at
+   * or below it was sent or filtered out, and none was dropped.
+   */
+  expire: (reason: StreamEndReason, position: number) => Promise<void>;
   /** Server-side lifetime cap (resolveStreamMaxLifetimeMs). */
   maxLifetimeMs: number;
   /** Register for wake-ups; returns the unregister function. */
@@ -311,21 +318,31 @@ export async function runConsumerStream(options: ConsumerStreamOptions): Promise
    * Server-initiated end. Row delivery stops at once: `stopped` is checked
    * before every row, so an in-flight scan's remaining rows are dropped (the
    * client resumes them via Last-Event-ID). `reconnect` goes out without
-   * waiting for that scan; the cleanup below still awaits it.
+   * waiting for that scan; the cleanup below still awaits it. It carries the
+   * position as of now, which never includes a dropped row: at worst a row
+   * whose write was still in flight is delivered again on resume.
    */
   const end = async (reason: StreamEndReason): Promise<void> => {
     if (stopped) return finished;
     stopped = true;
     clearTimeout(timer);
-    if (!signal.aborted) await options.expire(reason).catch(() => undefined);
+    if (!signal.aborted) await options.expire(reason, position).catch(() => undefined);
     finish();
   };
 
-  /** Send a page's rows in order; false once the stream ended (no row after the end). */
+  /**
+   * Send a page's rows in order; false once the stream ended (no row after
+   * the end). `position` advances row by row: before a send, to just below
+   * the row (every earlier row of the page was sent or filtered out); after
+   * it, to the row. A row dropped at the end is therefore never covered.
+   */
   const deliver = async (items: readonly OmniEvent[]): Promise<boolean> => {
     for (const row of items) {
       if (stopped) return false;
+      const seq = Number(row.journalSeq);
+      position = Math.max(position, seq - 1);
       await options.send(row);
+      position = Math.max(position, seq);
     }
     return !stopped;
   };

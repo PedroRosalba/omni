@@ -189,6 +189,7 @@ function harness(options: { journal: OmniEvent[]; match?: (r: OmniEvent) => bool
   let held: ((r: OmniEvent) => boolean) | null = null;
   const closed: Error[] = [];
   const expired: StreamEndReason[] = [];
+  const endPositions: number[] = [];
   const errors: unknown[] = [];
   let failNext: Error | null = null;
 
@@ -224,8 +225,9 @@ function harness(options: { journal: OmniEvent[]; match?: (r: OmniEvent) => bool
     close: async (error) => {
       closed.push(error);
     },
-    expire: async (reason) => {
+    expire: async (reason, position) => {
       expired.push(reason);
+      endPositions.push(position);
     },
     maxLifetimeMs: 60_000,
     subscribeWake: (w) => {
@@ -257,6 +259,7 @@ function harness(options: { journal: OmniEvent[]; match?: (r: OmniEvent) => bool
     sent,
     closed,
     expired,
+    endPositions,
     errors,
     heartbeats: () => heartbeats,
     unsubscribed: () => unsubscribed,
@@ -481,7 +484,7 @@ describe('stream lifetime cap (revocation ceiling)', () => {
     const first = harness({ journal, match });
     const appender = setInterval(() => journal.push(row(journal.length + 1)), 5);
     await first.run({ maxLifetimeMs: 40, fallbackMs: 5 });
-    const lastEventId = first.sent[first.sent.length - 1]?.journalSeq ?? 0;
+    const lastEventId = first.endPositions[0] ?? -1; // the reconnect event's id
 
     const second = harness({ journal, match });
     const done = second.run({ start: lastEventId, fallbackMs: 5 });
@@ -635,6 +638,115 @@ describe('lifetime cap stops row delivery at once', () => {
     });
     expect(expiredAt).toBeLessThan(70); // sent at the cap, not after the slow scan
     expect(sent).toEqual([]); // the late page is dropped; Last-Event-ID resumes it
+  });
+});
+
+describe('reconnect carries the scanned position as its id', () => {
+  test('a sparse filter on a busy journal resumes past the non-matching rows instead of re-scanning them', async () => {
+    const journal = Array.from({ length: 250 }, (_, i) => row(i + 1));
+    const match = (r: OmniEvent) => r.journalSeq === 3; // one match, then 247 non-matching rows
+    const first = harness({ journal, match, pageSize: 50 });
+    await first.run({ maxLifetimeMs: 40 });
+    expect(seqs(first.sent)).toEqual([3]);
+    expect(first.expired).toEqual(['lifetime']);
+    expect(first.endPositions).toEqual([250]); // last SCANNED, not last sent (3)
+
+    journal.push(row(251), row(252));
+    const second = harness({ journal, match: (r) => r.journalSeq === 3 || r.journalSeq === 252, pageSize: 50 });
+    const done = second.run({ start: first.endPositions[0] });
+    await settle();
+    second.abort();
+    await done;
+    expect(second.scans[0]).toBe(250); // no re-scan of the backlog
+    expect(seqs(second.sent)).toEqual([252]);
+  });
+
+  test('rows dropped at the lifetime cap mid-page are not covered by the reconnect id; resume delivers them', async () => {
+    const journal = Array.from({ length: 10 }, (_, i) => row(i + 1));
+    const match = (r: OmniEvent) => r.journalSeq % 3 === 0; // 3, 6, 9
+    const sent: number[] = [];
+    const positions: number[] = [];
+    let release: (() => void) | null = null;
+    const scanPage = (after: number): StreamScanResult => {
+      const rows = journal.filter((r) => r.journalSeq > after);
+      return {
+        items: rows.filter(match),
+        through: rows[rows.length - 1]?.journalSeq ?? null,
+        held: false,
+        full: false,
+      };
+    };
+    await runConsumerStream({
+      start: 0,
+      scan: async (after) => scanPage(after),
+      send: async (r) => {
+        sent.push(r.journalSeq);
+        // The first row's write lands just after the cap: the rest of the page is dropped.
+        if (r.journalSeq === 3) {
+          await new Promise<void>((resolve) => {
+            release = resolve;
+          });
+        }
+      },
+      heartbeat: async () => undefined,
+      close: async () => undefined,
+      expire: async (_reason, position) => {
+        positions.push(position);
+        release?.();
+      },
+      subscribeWake: () => () => undefined,
+      signal: new AbortController().signal,
+      heartbeatMs: 60_000,
+      fallbackMs: 60_000,
+      maxLifetimeMs: 20,
+    });
+    expect(sent).toEqual([3]); // 6 and 9 were dropped
+    // 1 and 2 were filtered out; 3's write had not landed at the cap, so the id
+    // stops below it: not the page end (10), and nothing past a dropped row.
+    expect(positions).toEqual([2]);
+
+    const resumed = harness({ journal, match });
+    const done = resumed.run({ start: positions[0] });
+    await settle();
+    resumed.abort();
+    await done;
+    expect(resumed.scans[0]).toBe(2);
+    expect(seqs(resumed.sent)).toEqual([3, 6, 9]); // the dropped rows arrive; 3 again (at-least-once)
+  });
+
+  test('a page landing after the cap leaves the reconnect id at the pre-page position', async () => {
+    const positions: number[] = [];
+    await runConsumerStream({
+      start: 5,
+      scan: (after) =>
+        after > 5
+          ? new Promise<StreamScanResult>(() => undefined)
+          : new Promise<StreamScanResult>((resolve) =>
+              setTimeout(() => resolve({ items: [row(6), row(7)], through: 20, held: false, full: false }), 60),
+            ),
+      send: async () => undefined,
+      heartbeat: async () => undefined,
+      close: async () => undefined,
+      expire: async (_reason, position) => {
+        positions.push(position);
+      },
+      subscribeWake: () => () => undefined,
+      signal: new AbortController().signal,
+      heartbeatMs: 60_000,
+      fallbackMs: 60_000,
+      maxLifetimeMs: 20,
+    });
+    expect(positions).toEqual([5]);
+  });
+
+  test('shutdown carries the scanned position too', async () => {
+    const h = harness({ journal: [row(1), row(2), row(3)], match: (r) => r.journalSeq === 1 });
+    const done = h.run();
+    await settle();
+    await closeAllConsumerStreams();
+    await done;
+    expect(h.expired).toEqual(['shutdown']);
+    expect(h.endPositions).toEqual([3]);
   });
 });
 

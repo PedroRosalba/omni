@@ -63,10 +63,9 @@ function buildApp(
         scans.push(after);
         accesses.push(access);
         const allowed = access.caller.instanceIds;
-        const rows = journal.filter(
-          (r) => r.journalSeq > after && (allowed === null || allowed.includes(r.instanceId ?? '')),
-        );
-        const last = rows[rows.length - 1];
+        const scanned = journal.filter((r) => r.journalSeq > after);
+        const rows = scanned.filter((r) => allowed === null || allowed.includes(r.instanceId ?? ''));
+        const last = scanned[scanned.length - 1]; // `through` covers filtered-out rows, as the real scan
         return { items: rows, through: last ? last.journalSeq : null, held: false, full: false };
       },
       pull: forbidden('pull'),
@@ -224,7 +223,19 @@ describe('GET /api/v2/events/consumers/:name/stream', () => {
       text += new TextDecoder().decode(value);
     }
     expect(text).toContain('id: 11\n');
-    expect(text).toMatch(/event: reconnect\ndata: \{"consumer":"vox","reason":"lifetime"\}\nretry: 1000\n\n$/);
+    expect(text).toMatch(/event: reconnect\ndata: \{"consumer":"vox","reason":"lifetime"\}\nid: 11\nretry: 1000\n\n$/);
+    expect(text).toMatch(/^event: connected\ndata: [^\n]*\n\n/); // `connected` carries no id
+  });
+
+  test('the reconnect id is the scanned position, past rows the filter dropped', async () => {
+    process.env.EVENT_STREAM_MAX_LIFETIME_MS = '60';
+    // The inst-a key receives only 11, yet the scan covers 12 and 13.
+    const { app } = buildApp({ journal: [row(11), row(12, 'inst-b'), row(13, 'inst-b')], instanceIds: ['inst-a'] });
+    const res = await app.request('/api/v2/events/consumers/vox/stream');
+    const text = await res.text();
+    expect(text).not.toContain('id: 12\n');
+    expect(text).toMatch(/event: reconnect\ndata: [^\n]*\nid: 13\nretry: 1000\n\n$/);
+    expect(text).toMatch(/^event: connected\ndata: [^\n]*\n\n/);
   });
 
   test('past EVENT_STREAM_MAX_PER_PROCESS a new stream is refused with 429', async () => {

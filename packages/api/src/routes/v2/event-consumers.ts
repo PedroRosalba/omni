@@ -205,11 +205,14 @@ eventConsumersRoutes.get(
               write(() =>
                 stream.writeSSE({ event: 'error', data: JSON.stringify({ consumer: name, message: error.message }) }),
               ),
-            expire: (reason) =>
+            // The id is the scanned position (a string: Hono drops a falsy id),
+            // so EventSource resumes past filtered-out rows; `connected` has none.
+            expire: (reason, position) =>
               write(() =>
                 stream.writeSSE({
                   event: 'reconnect',
                   data: JSON.stringify({ consumer: name, reason }),
+                  id: String(position),
                   retry: STREAM_RECONNECT_RETRY_MS,
                 }),
               ),

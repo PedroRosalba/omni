@@ -368,7 +368,8 @@ export function registerEventConsumerSchemas(registry: OpenAPIRegistry): void {
       'streams only its narrowed instances, and an instance-restricted API key only receives rows of its own ' +
       'instances. An access-filtered consumer holds an unfilled row until its verdict lands. A stream lives at most ' +
       'EVENT_STREAM_MAX_LIFETIME_MS (default and maximum 30000, the revocation ceiling), then ends with a ' +
-      '`reconnect` event carrying `retry:` — reconnect with Last-Event-ID to resume and re-authenticate. Past ' +
+      '`reconnect` event carrying `retry:` and `id:` (the scanned position, past filtered-out rows) — reconnect ' +
+      'with Last-Event-ID to resume and re-authenticate. Past ' +
       'EVENT_STREAM_MAX_PER_PROCESS open streams, or EVENT_STREAM_MAX_PER_KEY for the calling key, a new one is ' +
       'refused with 429.',
     request: {
