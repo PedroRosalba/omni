@@ -50,7 +50,7 @@ const superUrl = process.env.OMNI_G3_POSTGRES_URL ?? '';
 const postgresDescribe = superUrl.length > 0 ? describe : describe.skip;
 const psqlBin = process.env.OMNI_G3_PSQL_BIN ?? 'psql';
 
-const FULL_ACCESS = { tenantId: null, instanceIds: null };
+const FULL_ACCESS = { tenantId: null, caller: { keyId: null, instanceIds: null } };
 const TENANT_A = '11111111-1111-4111-8111-1111111111aa';
 const TENANT_B = '22222222-2222-4222-8222-2222222222bb';
 const INSTANCE_A = '55555555-5555-4555-8555-5555555555aa';
@@ -652,7 +652,7 @@ postgresDescribe('durable event consumers (#989, real PostgreSQL)', () => {
 
       const restricted = await service.scanForStream('jr-stream-instances', consumer.cursor, {
         tenantId: null,
-        instanceIds: [instanceId],
+        caller: { keyId: null, instanceIds: [instanceId] },
       });
       expect(restricted.items.map((e) => e.id)).toEqual([mine1.id, mine2.id]);
       expect(restricted.through).toBe(mine2.seq);
@@ -662,7 +662,7 @@ postgresDescribe('durable event consumers (#989, real PostgreSQL)', () => {
 
       const none = await service.scanForStream('jr-stream-instances', consumer.cursor, {
         tenantId: null,
-        instanceIds: [],
+        caller: { keyId: null, instanceIds: [] },
       });
       expect(none.items).toEqual([]);
       expect((await service.getByName('jr-stream-instances')).cursor).toBe(consumer.cursor);
@@ -723,6 +723,35 @@ postgresDescribe('durable event consumers (#989, real PostgreSQL)', () => {
         expect(page.items.map((e) => e.id)).toEqual([first.id, second.id]);
         expect(page.cursor).toBe(second.seq);
         expect((await service.ack('jr-access-gate', page.cursor)).cursor).toBe(second.seq);
+      });
+
+      test("(s) SSE stream scan on an 'allowed' consumer WITHOUT waitForReady: holds, then delivers; denied skipped", async () => {
+        const plain = await service.create({
+          name: 'jr-access-stream',
+          eventType: 'message.received',
+          access: 'allowed',
+        });
+        expect(plain.waitForReady).toBe(false);
+        const first = await claim('s1');
+        const second = await claim('s2');
+        await fill(second.id, 's2');
+        const denied = await claim('s3', deniedInstanceId);
+        await fill(denied.id, 's3', deniedInstanceId);
+        const dead = await claim('s4');
+        await backdate(dead.id);
+        const last = await claim('s5');
+        await fill(last.id, 's5');
+
+        // The young unfilled row holds the stream page (the pull without waitForReady would skip it).
+        const held = await service.scanForStream('jr-access-stream', plain.cursor, FULL_ACCESS);
+        expect(held).toEqual({ items: [], through: null, held: true, full: false });
+
+        await fill(first.id, 's1');
+        const page = await service.scanForStream('jr-access-stream', plain.cursor, FULL_ACCESS);
+        expect(page.items.map((e) => e.id)).toEqual([first.id, second.id, last.id]); // denied + dead skipped
+        expect(page.through).toBe(last.seq);
+        expect(page.held).toBe(false);
+        expect((await service.getByName('jr-access-stream')).cursor).toBe(plain.cursor);
       });
 
       test("(g) 'allowed': a 'denied' fill is skipped and a dead unfilled row neither delivers nor stalls", async () => {
@@ -909,6 +938,17 @@ postgresDescribe('durable event consumers (#989, real PostgreSQL)', () => {
       const inspected = await service.inspect('scoped-0080', owner);
       expect(inspected.caughtUp).toBe(true);
       expect(inspected.lag).toBeGreaterThan(0);
+    });
+
+    test('SSE stream scan resolves like pull: the owner streams only its instances, a stranger gets 404', async () => {
+      const cursor = (await service.getByName('scoped-0080')).cursor;
+      const page = await service.scanForStream('scoped-0080', 0, { tenantId: null, caller: owner });
+      expect(page.items.map((e) => e.id)).toEqual([idOf('a1'), idOf('a2')]);
+      await expect(
+        service.scanForStream('scoped-0080', 0, { tenantId: null, caller: otherRestricted }),
+      ).rejects.toThrow(/not found/i);
+      await expect(service.getStreamable('scoped-0080', otherRestricted)).rejects.toThrow(/not found/i);
+      expect((await service.getByName('scoped-0080')).cursor).toBe(cursor);
     });
 
     test('a non-owner restricted key gets 404 on get/pull/ack/delete and does not see it listed', async () => {

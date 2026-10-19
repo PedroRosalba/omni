@@ -36,6 +36,7 @@ import {
   consumerStreamWakeHub,
   resolveStreamIntervalMs,
   resolveStreamMaxLifetimeMs,
+  resolveStreamMaxPerKey,
   resolveStreamMaxPerProcess,
   resolveStreamStart,
   runConsumerStream,
@@ -140,34 +141,34 @@ eventConsumersRoutes.get(
     const { after } = c.req.valid('query');
     const lastEventId = c.req.valid('header')['last-event-id'];
     const services = c.get('services');
-    // 404 / 400 (shared) while a JSON error can still be returned.
-    const consumer = await services.eventConsumers.getStreamable(name);
+    const caller = consumerCaller(c);
+    // 404 (missing, or scoped and not visible to this key) / 400 (shared)
+    // while a JSON error can still be returned; resolved exactly as pull.
+    const consumer = await services.eventConsumers.getStreamable(name, caller);
     const start = resolveStreamStart({
       lastEventId: lastEventId === undefined ? undefined : Number(lastEventId),
       after: after === undefined ? undefined : Number(after),
       cursor: consumer.cursor,
     });
-    const maxPerProcess = resolveStreamMaxPerProcess();
-    const release = acquireConsumerStreamSlot(maxPerProcess);
-    if (!release) {
+    const slot = acquireConsumerStreamSlot(caller.keyId, {
+      perProcess: resolveStreamMaxPerProcess(),
+      perKey: resolveStreamMaxPerKey(),
+    });
+    if ('refused' in slot) {
       c.header('Retry-After', String(Math.ceil(STREAM_RECONNECT_RETRY_MS / 1000)));
+      const message =
+        slot.refused === 'key'
+          ? 'Too many open event streams for this API key. Close one, retry shortly, or use pull.'
+          : 'Too many open event streams on this server. Retry shortly or use pull.';
       return c.json(
-        {
-          error: {
-            code: 'RATE_LIMITED',
-            message: 'Too many open event streams on this server. Retry shortly or use pull.',
-            details: { limit: maxPerProcess },
-          },
-        },
+        { error: { code: 'RATE_LIMITED', message, details: { limit: slot.limit, scope: slot.refused } } },
         429,
       );
     }
+    const { release } = slot;
     // The request's transaction commits once this handler returns; the stream
     // re-enters the tenant per page (scanForStream) instead of inheriting it.
-    const access = {
-      tenantId: currentTenantScope()?.tenantId ?? null,
-      instanceIds: c.get('apiKey')?.instanceIds ?? null,
-    };
+    const access = { tenantId: currentTenantScope()?.tenantId ?? null, caller };
     const heartbeatMs = resolveStreamIntervalMs(process.env.EVENT_STREAM_HEARTBEAT_MS, DEFAULT_STREAM_HEARTBEAT_MS);
     const fallbackMs = resolveStreamIntervalMs(process.env.STREAM_POLL_FALLBACK_MS, DEFAULT_STREAM_POLL_FALLBACK_MS);
     const maxLifetimeMs = resolveStreamMaxLifetimeMs();

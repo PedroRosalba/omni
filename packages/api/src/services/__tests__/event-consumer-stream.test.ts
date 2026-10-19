@@ -23,6 +23,7 @@ import {
   liveConsumerStreamCount,
   resolveStreamIntervalMs,
   resolveStreamMaxLifetimeMs,
+  resolveStreamMaxPerKey,
   resolveStreamMaxPerProcess,
   resolveStreamStart,
   runConsumerStream,
@@ -30,7 +31,7 @@ import {
 } from '../event-consumer-stream';
 import { EventConsumerService, type StreamScanResult, streamInstanceClause } from '../event-consumers';
 
-const FULL_ACCESS = { tenantId: null, instanceIds: null };
+const FULL_ACCESS = { tenantId: null, caller: { keyId: null, instanceIds: null } };
 
 const SETTLE_MS = 5_000;
 
@@ -57,6 +58,10 @@ function consumer(extra: Partial<DurableConsumer> = {}): DurableConsumer {
     shared: false,
     waitForReady: false,
     leaseState: null,
+    accessFilter: 'all',
+    scoped: false,
+    instanceIds: null,
+    ownerKeyId: null,
     createdAt: new Date(),
     updatedAt: new Date(),
     ...extra,
@@ -506,20 +511,44 @@ describe('stream lifetime cap (revocation ceiling)', () => {
   });
 });
 
-describe('per-process stream cap', () => {
-  test('slots are refused past the cap and freed on release (idempotently)', () => {
-    const one = acquireConsumerStreamSlot(2);
-    const two = acquireConsumerStreamSlot(2);
-    expect(one).not.toBeNull();
-    expect(two).not.toBeNull();
-    expect(acquireConsumerStreamSlot(2)).toBeNull();
-    one?.();
-    one?.();
-    const three = acquireConsumerStreamSlot(2);
-    expect(three).not.toBeNull();
-    expect(acquireConsumerStreamSlot(2)).toBeNull();
-    two?.();
-    three?.();
+describe('stream slot caps (per process and per API key)', () => {
+  const release = (slot: ReturnType<typeof acquireConsumerStreamSlot>) => {
+    if (!('release' in slot)) throw new Error(`refused by the ${slot.refused} cap`);
+    return slot.release;
+  };
+
+  test('process slots are refused past the cap and freed on release (idempotently)', () => {
+    const limits = { perProcess: 2, perKey: 10 };
+    const one = release(acquireConsumerStreamSlot('key-a', limits));
+    const two = release(acquireConsumerStreamSlot(null, limits));
+    expect(acquireConsumerStreamSlot('key-b', limits)).toEqual({ refused: 'process', limit: 2 });
+    one();
+    one();
+    const three = release(acquireConsumerStreamSlot('key-b', limits));
+    expect(acquireConsumerStreamSlot('key-c', limits)).toEqual({ refused: 'process', limit: 2 });
+    two();
+    three();
+  });
+
+  test('a key is refused past its own cap while other keys (and keyless requests) still open streams', () => {
+    const limits = { perProcess: 100, perKey: 2 };
+    const a1 = release(acquireConsumerStreamSlot('key-a', limits));
+    const a2 = release(acquireConsumerStreamSlot('key-a', limits));
+    expect(acquireConsumerStreamSlot('key-a', limits)).toEqual({ refused: 'key', limit: 2 });
+    const b1 = release(acquireConsumerStreamSlot('key-b', limits));
+    const anon = release(acquireConsumerStreamSlot(null, limits));
+    a1();
+    a1(); // idempotent: frees exactly one of key-a's slots
+    const a3 = release(acquireConsumerStreamSlot('key-a', limits));
+    expect(acquireConsumerStreamSlot('key-a', limits)).toEqual({ refused: 'key', limit: 2 });
+    for (const free of [a2, a3, b1, anon]) free();
+  });
+
+  test('EVENT_STREAM_MAX_PER_KEY defaults to 5', () => {
+    expect(resolveStreamMaxPerKey(undefined)).toBe(5);
+    expect(resolveStreamMaxPerKey('0')).toBe(5);
+    expect(resolveStreamMaxPerKey('1.5')).toBe(5);
+    expect(resolveStreamMaxPerKey('3')).toBe(3);
   });
 
   test('EVENT_STREAM_MAX_PER_PROCESS defaults to 100', () => {
@@ -564,11 +593,125 @@ describe('instance restriction (B1)', () => {
   test("the stream scan carries the key's instance predicate; a full key's scan does not", async () => {
     const wheres: unknown[] = [];
     const service = new EventConsumerService(fakePool(consumer(), () => [row(8)], wheres));
-    await service.scanForStream('vox', 7, { tenantId: null, instanceIds: ['inst-a'] });
+    await service.scanForStream('vox', 7, { tenantId: null, caller: { keyId: null, instanceIds: ['inst-a'] } });
     await service.scanForStream('vox', 7, FULL_ACCESS);
     const [restricted, full] = wheres.map((w) => render(w as Parameters<PgDialect['sqlToQuery']>[0]));
     expect(restricted?.sql).toContain('"instance_id" in');
     expect(restricted?.params).toContain('inst-a');
     expect(full?.sql).not.toContain('instance_id');
+  });
+});
+
+describe('lifetime cap stops row delivery at once', () => {
+  test('rows of a scan still in flight when the lifetime fires are dropped, and reconnect is not delayed', async () => {
+    let release: (() => void) | null = null;
+    const sent: number[] = [];
+    let expiredAt = 0;
+    const controller = new AbortController();
+    const started = Date.now();
+    await runConsumerStream({
+      start: 0,
+      scan: (after) =>
+        after > 0
+          ? new Promise<StreamScanResult>(() => undefined)
+          : new Promise<StreamScanResult>((resolve) => {
+              // A slow page: it resolves only after the lifetime has fired.
+              release = () => resolve({ items: [row(1), row(2)], through: 2, held: false, full: false });
+              setTimeout(() => release?.(), 80);
+            }),
+      send: async (r) => {
+        sent.push(r.journalSeq);
+      },
+      heartbeat: async () => undefined,
+      close: async () => undefined,
+      expire: async () => {
+        expiredAt = Date.now() - started;
+      },
+      subscribeWake: () => () => undefined,
+      signal: controller.signal,
+      heartbeatMs: 60_000,
+      fallbackMs: 60_000,
+      maxLifetimeMs: 20,
+    });
+    expect(expiredAt).toBeLessThan(70); // sent at the cap, not after the slow scan
+    expect(sent).toEqual([]); // the late page is dropped; Last-Event-ID resumes it
+  });
+});
+
+describe('stream scan x access filter (#1299) x readiness gate', () => {
+  const settled = () => new Date(Date.now() - SETTLE_MS - 1_000);
+  const render = (w: unknown) => new PgDialect().sqlToQuery(w as Parameters<PgDialect['sqlToQuery']>[0]);
+
+  for (const waitForReady of [false, true]) {
+    describe(`consumer waitForReady=${waitForReady}`, () => {
+      const filtered = () => consumer({ accessFilter: 'allowed', waitForReady });
+
+      test('the SQL admits unfilled rows (gate forced on widens the access predicate)', async () => {
+        const wheres: unknown[] = [];
+        await new EventConsumerService(fakePool(filtered(), () => [], wheres)).scanForStream('vox', 7, FULL_ACCESS);
+        const query = render(wheres[0]);
+        expect(query.sql).toContain('"access_decision" =');
+        expect(query.sql).toContain('"journal_ready" =');
+      });
+
+      test('an unfilled row is held, then delivered after an allowed fill', async () => {
+        let page = [row(8, { journalReady: false, accessDecision: null }), row(9, { accessDecision: 'allowed' })];
+        const service = new EventConsumerService(fakePool(filtered(), () => page));
+        const held = await service.scanForStream('vox', 7, FULL_ACCESS);
+        expect(held).toEqual({ items: [], through: null, held: true, full: false });
+        page = [row(8, { accessDecision: 'allowed' }), row(9, { accessDecision: 'allowed' })];
+        const filled = await service.scanForStream('vox', 7, FULL_ACCESS);
+        expect(seqs(filled.items)).toEqual([8, 9]);
+      });
+
+      test('a denied fill and a dead unfilled row are skipped, and the position moves past them', async () => {
+        const page = [
+          row(8, { accessDecision: 'denied' }),
+          row(9, { journalReady: false, accessDecision: null, receivedAt: settled() }),
+          row(10, { accessDecision: 'allowed' }),
+        ];
+        const result = await new EventConsumerService(fakePool(filtered(), () => page)).scanForStream(
+          'vox',
+          7,
+          FULL_ACCESS,
+        );
+        expect(seqs(result.items)).toEqual([10]);
+        expect(result).toMatchObject({ through: 10, held: false });
+      });
+    });
+  }
+});
+
+describe('stream scan x instance-scoped consumers (#1298)', () => {
+  const INST_A = '11111111-1111-4111-8111-1111111111aa';
+  const INST_B = '11111111-1111-4111-8111-1111111111bb';
+  const OWNER = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const scoped = () => consumer({ scoped: true, instanceIds: [INST_A, INST_B], ownerKeyId: OWNER });
+  const render = (w: unknown) => new PgDialect().sqlToQuery(w as Parameters<PgDialect['sqlToQuery']>[0]);
+
+  test('a restricted non-owner key gets 404 (getStreamable and every page)', async () => {
+    const service = new EventConsumerService(fakePool(scoped(), () => [row(8)]));
+    const stranger = { keyId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', instanceIds: [INST_A] };
+    await expect(service.getStreamable('vox', stranger)).rejects.toBeInstanceOf(NotFoundError);
+    await expect(service.scanForStream('vox', 7, { tenantId: null, caller: stranger })).rejects.toBeInstanceOf(
+      NotFoundError,
+    );
+  });
+
+  test('a restricted owner is narrowed to the stored instances its key still has, as in pull', async () => {
+    const wheres: unknown[] = [];
+    const service = new EventConsumerService(fakePool(scoped(), () => [row(8)], wheres));
+    const owner = { keyId: OWNER, instanceIds: [INST_A] };
+    expect((await service.getStreamable('vox', owner)).instanceIds).toEqual([INST_A]);
+    await service.scanForStream('vox', 7, { tenantId: null, caller: owner });
+    const query = render(wheres[0]);
+    expect(query.params).toContain(INST_A);
+    expect(query.params).not.toContain(INST_B);
+  });
+
+  test('an unrestricted key sees the scoped consumer with its full instance set', async () => {
+    const service = new EventConsumerService(fakePool(scoped(), () => []));
+    const admin = { keyId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', instanceIds: null };
+    expect((await service.getStreamable('vox', admin)).instanceIds).toEqual([INST_A, INST_B]);
   });
 });

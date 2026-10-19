@@ -12,7 +12,7 @@ import type { DurableConsumer, OmniEvent } from '@omni/db';
 import { Hono } from 'hono';
 import { SCOPE_MAP } from '../../../constants/scopes';
 import { errorHandler } from '../../../middleware/error';
-import type { StreamAccess, StreamScanResult } from '../../../services/event-consumers';
+import type { ConsumerCaller, StreamAccess, StreamScanResult } from '../../../services/event-consumers';
 import type { AppVariables } from '../../../types';
 import { eventConsumersRoutes } from '../event-consumers';
 
@@ -43,8 +43,9 @@ function row(seq: number, instanceId = 'inst-a'): OmniEvent {
 function buildApp(
   options: {
     journal?: OmniEvent[];
-    getStreamable?: (name: string) => Promise<DurableConsumer>;
+    getStreamable?: (name: string, caller?: ConsumerCaller) => Promise<DurableConsumer>;
     instanceIds?: string[] | null;
+    keyId?: string;
   } = {},
 ) {
   const journal = options.journal ?? [];
@@ -61,7 +62,7 @@ function buildApp(
       scanForStream: async (_name: string, after: number, access: StreamAccess): Promise<StreamScanResult> => {
         scans.push(after);
         accesses.push(access);
-        const allowed = access.instanceIds;
+        const allowed = access.caller.instanceIds;
         const rows = journal.filter(
           (r) => r.journalSeq > after && (allowed === null || allowed.includes(r.instanceId ?? '')),
         );
@@ -78,7 +79,7 @@ function buildApp(
   app.use('*', async (c, next) => {
     c.set('services', services);
     if (options.instanceIds !== undefined) {
-      c.set('apiKey', { instanceIds: options.instanceIds } as unknown as AppVariables['apiKey']);
+      c.set('apiKey', { id: options.keyId, instanceIds: options.instanceIds } as unknown as AppVariables['apiKey']);
     }
     await next();
   });
@@ -102,6 +103,7 @@ async function readUntil(response: Response, until: RegExp): Promise<string> {
 }
 
 const ENV_KEYS = [
+  'EVENT_STREAM_MAX_PER_KEY',
   'EVENT_STREAM_HEARTBEAT_MS',
   'STREAM_POLL_FALLBACK_MS',
   'EVENT_STREAM_MAX_LIFETIME_MS',
@@ -199,13 +201,13 @@ describe('GET /api/v2/events/consumers/:name/stream', () => {
     const journal = [row(11, 'inst-a'), row(12, 'inst-b'), row(13, 'inst-a')];
     const restricted = buildApp({ journal, instanceIds: ['inst-a'] });
     const mine = await readUntil(await restricted.app.request('/api/v2/events/consumers/vox/stream'), /id: 13\n/);
-    expect(restricted.accesses[0]).toEqual({ tenantId: null, instanceIds: ['inst-a'] });
+    expect(restricted.accesses[0]).toEqual({ tenantId: null, caller: { keyId: null, instanceIds: ['inst-a'] } });
     expect(mine).toContain('id: 11\n');
     expect(mine).not.toContain('id: 12\n');
 
     const full = buildApp({ journal, instanceIds: null });
     const all = await readUntil(await full.app.request('/api/v2/events/consumers/vox/stream'), /id: 13\n/);
-    expect(full.accesses[0]).toEqual({ tenantId: null, instanceIds: null });
+    expect(full.accesses[0]).toEqual({ tenantId: null, caller: { keyId: null, instanceIds: null } });
     expect(all).toContain('id: 12\n');
   });
 
@@ -244,5 +246,43 @@ describe('GET /api/v2/events/consumers/:name/stream', () => {
   test('requires events:write, the same scope as pull (an events:read key cannot stream)', () => {
     expect(SCOPE_MAP['GET /events/consumers/:name/stream']).toBe('events:write');
     expect(SCOPE_MAP['GET /events/consumers/:name/stream']).toBe(SCOPE_MAP['POST /events/consumers/:name/pull']);
+  });
+
+  test('the route resolves the consumer with the pull caller (scoped and not visible -> 404, nothing streamed)', async () => {
+    const seen: (ConsumerCaller | undefined)[] = [];
+    const { app, scans } = buildApp({
+      keyId: 'key-other',
+      instanceIds: ['inst-z'],
+      getStreamable: async (name, caller) => {
+        seen.push(caller);
+        throw new NotFoundError('DurableConsumer', name);
+      },
+    });
+    const res = await app.request('/api/v2/events/consumers/vox/stream');
+    expect(res.status).toBe(404);
+    expect(await res.text()).not.toContain('connected');
+    expect(seen).toEqual([{ keyId: 'key-other', instanceIds: ['inst-z'] }]);
+    expect(scans).toEqual([]);
+  });
+
+  test('past EVENT_STREAM_MAX_PER_KEY a key gets 429 while another key still streams', async () => {
+    process.env.EVENT_STREAM_MAX_PER_KEY = '1';
+    const one = buildApp({ keyId: 'key-1', instanceIds: null });
+    const open = await one.app.request('/api/v2/events/consumers/vox/stream');
+    const reader = open.body?.getReader();
+    await reader?.read(); // connected
+    const refused = await one.app.request('/api/v2/events/consumers/vox/stream');
+    expect(refused.status).toBe(429);
+    expect(JSON.stringify(await refused.json())).toContain('"scope":"key"');
+    const other = await buildApp({ keyId: 'key-2', instanceIds: null }).app.request(
+      '/api/v2/events/consumers/vox/stream',
+    );
+    expect(other.status).toBe(200);
+    await other.body?.cancel();
+    await reader?.cancel();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const again = await one.app.request('/api/v2/events/consumers/vox/stream');
+    expect(again.status).toBe(200); // released on disconnect
+    await again.body?.cancel();
   });
 });

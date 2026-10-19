@@ -363,11 +363,14 @@ export function registerEventConsumerSchemas(registry: OpenAPIRegistry): void {
       '`connected` event; a `: heartbeat` comment is sent every EVENT_STREAM_HEARTBEAT_MS (default 15000). ' +
       'READ-ONLY: the stream never moves the stored cursor and never takes a lease — keep acking with ' +
       'POST /events/consumers/{name}/ack. Fan-out consumers only: a shared consumer is refused with 400. A ' +
-      'consumer deleted mid-stream ends the stream with an `error` event. Requires events:write (as pull); an ' +
-      'instance-restricted API key only receives rows of its own instances. A stream lives at most ' +
+      'consumer deleted mid-stream ends the stream with an `error` event. Requires events:write (as pull) and ' +
+      'resolves the consumer exactly as pull: a scoped consumer the key may not see is 404, a restricted owner ' +
+      'streams only its narrowed instances, and an instance-restricted API key only receives rows of its own ' +
+      'instances. An access-filtered consumer holds an unfilled row until its verdict lands. A stream lives at most ' +
       'EVENT_STREAM_MAX_LIFETIME_MS (default and maximum 30000, the revocation ceiling), then ends with a ' +
       '`reconnect` event carrying `retry:` — reconnect with Last-Event-ID to resume and re-authenticate. Past ' +
-      'EVENT_STREAM_MAX_PER_PROCESS open streams a new one is refused with 429.',
+      'EVENT_STREAM_MAX_PER_PROCESS open streams, or EVENT_STREAM_MAX_PER_KEY for the calling key, a new one is ' +
+      'refused with 429.',
     request: {
       params: z.object({ name: z.string().openapi({ description: 'Consumer name' }) }),
       query: StreamConsumerQuerySchema,
@@ -384,7 +387,7 @@ export function registerEventConsumerSchemas(registry: OpenAPIRegistry): void {
       },
       404: { description: 'No such consumer', content: { 'application/json': { schema: ErrorSchema } } },
       429: {
-        description: 'Too many open streams on this server (EVENT_STREAM_MAX_PER_PROCESS)',
+        description: 'Too many open streams on this server or for this key (EVENT_STREAM_MAX_PER_PROCESS / _PER_KEY)',
         content: { 'application/json': { schema: ErrorSchema } },
       },
     },

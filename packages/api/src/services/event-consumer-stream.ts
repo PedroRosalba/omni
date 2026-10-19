@@ -51,6 +51,8 @@ export const STREAM_RECONNECT_RETRY_MS = 1_000;
 export const STREAM_MAX_LIFETIME_CEILING_MS = STREAM_TERMINATION_CEILING_SECONDS * 1000;
 /** Default per-process cap on open streams (EVENT_STREAM_MAX_PER_PROCESS). */
 const DEFAULT_STREAM_MAX_PER_PROCESS = 100;
+/** Default per-API-key cap on open streams (EVENT_STREAM_MAX_PER_KEY). */
+const DEFAULT_STREAM_MAX_PER_KEY = 5;
 
 /** A positive interval from the environment, or the default. Read per stream. */
 export function resolveStreamIntervalMs(raw: string | undefined, fallback: number): number {
@@ -64,27 +66,58 @@ export function resolveStreamMaxLifetimeMs(raw: string | undefined = process.env
   return Math.min(resolveStreamIntervalMs(raw, STREAM_MAX_LIFETIME_CEILING_MS), STREAM_MAX_LIFETIME_CEILING_MS);
 }
 
-/** EVENT_STREAM_MAX_PER_PROCESS: a positive integer, or the default. */
+/** A positive integer from the environment, or the default. */
+function resolvePositiveInt(raw: string | undefined, fallback: number): number {
+  const parsed = resolveStreamIntervalMs(raw, fallback);
+  return Number.isInteger(parsed) ? parsed : fallback;
+}
+
+/** EVENT_STREAM_MAX_PER_PROCESS: a positive integer, or the default (100). */
 export function resolveStreamMaxPerProcess(raw: string | undefined = process.env.EVENT_STREAM_MAX_PER_PROCESS): number {
-  const parsed = resolveStreamIntervalMs(raw, DEFAULT_STREAM_MAX_PER_PROCESS);
-  return Number.isInteger(parsed) ? parsed : DEFAULT_STREAM_MAX_PER_PROCESS;
+  return resolvePositiveInt(raw, DEFAULT_STREAM_MAX_PER_PROCESS);
+}
+
+/** EVENT_STREAM_MAX_PER_KEY: a positive integer, or the default (5). */
+export function resolveStreamMaxPerKey(raw: string | undefined = process.env.EVENT_STREAM_MAX_PER_KEY): number {
+  return resolvePositiveInt(raw, DEFAULT_STREAM_MAX_PER_KEY);
 }
 
 let openStreamSlots = 0;
+const openStreamsByKey = new Map<string, number>();
+
+export interface StreamSlotLimits {
+  /** Cap for the whole process. */
+  perProcess: number;
+  /** Cap per API key (legacy and tenant keys alike, keyed by key id). */
+  perKey: number;
+}
 
 /**
- * Reserve one of the process's stream slots, synchronously (so concurrent
- * requests cannot overshoot the cap). Returns the release function, or null
- * when `max` streams are already open. Release is idempotent.
+ * Reserve a stream slot for `keyId`, synchronously (so concurrent requests
+ * cannot overshoot either cap). Returns the release function, or the cap that
+ * refused it. A request with no key id counts toward the process cap only.
+ * Release is idempotent.
  */
-export function acquireConsumerStreamSlot(max: number): (() => void) | null {
-  if (openStreamSlots >= max) return null;
+export function acquireConsumerStreamSlot(
+  keyId: string | null,
+  limits: StreamSlotLimits,
+): { release: () => void } | { refused: 'process' | 'key'; limit: number } {
+  if (openStreamSlots >= limits.perProcess) return { refused: 'process', limit: limits.perProcess };
+  const held = keyId === null ? 0 : (openStreamsByKey.get(keyId) ?? 0);
+  if (keyId !== null && held >= limits.perKey) return { refused: 'key', limit: limits.perKey };
   openStreamSlots++;
+  if (keyId !== null) openStreamsByKey.set(keyId, held + 1);
   let released = false;
-  return () => {
-    if (released) return;
-    released = true;
-    openStreamSlots--;
+  return {
+    release: () => {
+      if (released) return;
+      released = true;
+      openStreamSlots--;
+      if (keyId === null) return;
+      const left = (openStreamsByKey.get(keyId) ?? 1) - 1;
+      if (left > 0) openStreamsByKey.set(keyId, left);
+      else openStreamsByKey.delete(keyId);
+    },
   };
 }
 
@@ -274,24 +307,34 @@ export async function runConsumerStream(options: ConsumerStreamOptions): Promise
   if (signal.aborted) stop();
   else signal.addEventListener('abort', stop, { once: true });
 
-  /** Server-initiated end: let an in-flight scan settle, then send `reconnect` and finish. */
+  /**
+   * Server-initiated end. Row delivery stops at once: `stopped` is checked
+   * before every row, so an in-flight scan's remaining rows are dropped (the
+   * client resumes them via Last-Event-ID). `reconnect` goes out without
+   * waiting for that scan; the cleanup below still awaits it.
+   */
   const end = async (reason: StreamEndReason): Promise<void> => {
     if (stopped) return finished;
     stopped = true;
     clearTimeout(timer);
-    await inflight.catch(() => undefined);
     if (!signal.aborted) await options.expire(reason).catch(() => undefined);
     finish();
+  };
+
+  /** Send a page's rows in order; false once the stream ended (no row after the end). */
+  const deliver = async (items: readonly OmniEvent[]): Promise<boolean> => {
+    for (const row of items) {
+      if (stopped) return false;
+      await options.send(row);
+    }
+    return !stopped;
   };
 
   /** Scan and send until the journal is drained or a row is held. */
   const drain = async (): Promise<'held' | 'idle'> => {
     for (;;) {
       const page = await options.scan(position);
-      for (const row of page.items) {
-        if (stopped) return 'idle';
-        await options.send(row);
-      }
+      if (!(await deliver(page.items))) return 'idle';
       if (page.through !== null) position = Math.max(position, page.through);
       if (page.held) return 'held';
       if (!page.full || stopped) return 'idle';
