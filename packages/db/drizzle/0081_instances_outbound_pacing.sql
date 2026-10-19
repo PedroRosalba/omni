@@ -15,9 +15,8 @@
 -- key cannot defeat a humanized instance on its own. The API lets only a
 -- full-access ('*') key set outbound_pacing_override to true.
 --
--- Numbering: open PR #1294 also claims 0080. Per the parallel-worktree rule,
--- whichever PR merges second renumbers its own migration (file, journal idx,
--- tag and `when`); the migration that landed first is never renumbered.
+-- Numbering: renumbered from 0080 to 0081 after #1294 (0080_event_journal_ready)
+-- landed on dev, per the parallel-worktree rule.
 --
 -- Hand-written following the 0043/0044/0052 precedent (additive, idempotent).
 -- No explicit BEGIN/COMMIT — the boot migrator executes this file on a pooled
