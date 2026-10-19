@@ -424,6 +424,8 @@ postgresDescribe('durable event consumers (#989, real PostgreSQL)', () => {
 
   describe('opt-in journal readiness gate (waitForReady)', () => {
     let instanceId: string;
+    /** An allowlist instance with no rules: every inbound sender is journaled 'denied'. */
+    let deniedInstanceId: string;
     let fillHandler: CustomEventHandler;
     let ingress: NonNullable<ReturnType<typeof createPluginContext>['ingressClaim']>;
 
@@ -434,6 +436,12 @@ postgresDescribe('durable event consumers (#989, real PostgreSQL)', () => {
         .returning();
       if (!instance) throw new Error('instance seed failed');
       instanceId = instance.id;
+      const [denying] = await db
+        .insert(instances)
+        .values({ name: `inst-journal-denied-${randomUUID()}`, channel: 'whatsapp-baileys', accessMode: 'allowlist' })
+        .returning();
+      if (!denying) throw new Error('denying instance seed failed');
+      deniedInstanceId = denying.id;
       fillHandler = await captureMessageReceivedHandler(db);
       const claimer = createPluginContext({ pluginId: 'whatsapp-baileys', eventBus: {} as EventBus, db }).ingressClaim;
       if (!claimer) throw new Error('ingressClaim missing from plugin context');
@@ -441,10 +449,10 @@ postgresDescribe('durable event consumers (#989, real PostgreSQL)', () => {
     });
 
     /** A real ingress claim: commits the hollow skeleton row (journal_ready = false). */
-    async function claim(tag: string): Promise<{ id: string; seq: number }> {
+    async function claim(tag: string, onInstance = instanceId): Promise<{ id: string; seq: number }> {
       const id = await ingress.claim({
-        idempotencyKey: `whatsapp-baileys:${instanceId}:jr-${tag}-${randomUUID()}`,
-        instanceId,
+        idempotencyKey: `whatsapp-baileys:${onInstance}:jr-${tag}-${randomUUID()}`,
+        instanceId: onInstance,
         channelType: 'whatsapp-baileys',
         externalId: `jr-${tag}`,
       });
@@ -457,7 +465,7 @@ postgresDescribe('durable event consumers (#989, real PostgreSQL)', () => {
     }
 
     /** The real message.received persistence fill under the claimed id. */
-    async function fill(id: string, tag: string): Promise<void> {
+    async function fill(id: string, tag: string, onInstance = instanceId): Promise<void> {
       await fillHandler({
         id,
         type: 'message.received',
@@ -469,7 +477,7 @@ postgresDescribe('durable event consumers (#989, real PostgreSQL)', () => {
           content: { type: 'text', text: `hello ${tag}` },
           rawPayload: { kind: 'jr', tag },
         },
-        metadata: { correlationId: id, instanceId, channelType: 'whatsapp-baileys' },
+        metadata: { correlationId: id, instanceId: onInstance, channelType: 'whatsapp-baileys' },
       });
       const [row] = await db.select().from(omniEvents).where(eq(omniEvents.id, id));
       expect(row?.journalReady).toBe(true);
@@ -658,6 +666,138 @@ postgresDescribe('durable event consumers (#989, real PostgreSQL)', () => {
       });
       expect(none.items).toEqual([]);
       expect((await service.getByName('jr-stream-instances')).cursor).toBe(consumer.cursor);
+    });
+
+    describe('access filter + waitForReady (#1299 on #1294)', () => {
+      const ACCESS_ENV = 'OMNI_JOURNAL_ACCESS_DECISION';
+      let savedAccessEnv: string | undefined;
+      beforeAll(() => {
+        savedAccessEnv = process.env[ACCESS_ENV];
+        process.env[ACCESS_ENV] = 'true'; // create() accepts access, the fill journals the verdict
+      });
+      afterAll(() => {
+        if (savedAccessEnv === undefined) delete process.env[ACCESS_ENV];
+        else process.env[ACCESS_ENV] = savedAccessEnv;
+      });
+
+      async function decisionOf(id: string): Promise<string | null | undefined> {
+        const [row] = await db.select().from(omniEvents).where(eq(omniEvents.id, id));
+        return row?.accessDecision;
+      }
+
+      async function backdate(id: string): Promise<void> {
+        await db
+          .update(omniEvents)
+          .set({ receivedAt: new Date(Date.now() - 60_000) })
+          .where(eq(omniEvents.id, id));
+      }
+
+      test("(f) 'allowed': an unfilled row holds the page until its verdict lands, then both rows deliver in order", async () => {
+        const gated = await service.create({
+          name: 'jr-access-gate',
+          eventType: 'message.received',
+          access: 'allowed',
+          waitForReady: true,
+        });
+        await service.create({ name: 'jr-access-nogate', eventType: 'message.received', access: 'allowed' });
+        expect(gated.accessFilter).toBe('allowed');
+        expect(gated.waitForReady).toBe(true);
+        const first = await claim('f1');
+        const second = await claim('f2');
+        await fill(second.id, 'f2');
+        expect(await decisionOf(first.id)).toBeNull();
+        expect(await decisionOf(second.id)).toBe('allowed');
+
+        const held = await service.pull('jr-access-gate', { limit: 10 });
+        expect(held.items).toEqual([]);
+        expect(held.cursor).toBe(gated.cursor);
+        expect((await service.getByName('jr-access-gate')).cursor).toBe(gated.cursor);
+
+        // Documented gap: without waitForReady the plain SQL predicate already skips the unfilled row.
+        const gap = await service.pull('jr-access-nogate', { limit: 10 });
+        expect(gap.items.map((e) => e.id)).toEqual([second.id]);
+
+        await fill(first.id, 'f1');
+        expect(await decisionOf(first.id)).toBe('allowed');
+        const page = await service.pull('jr-access-gate', { limit: 10 });
+        expect(page.items.map((e) => e.id)).toEqual([first.id, second.id]);
+        expect(page.cursor).toBe(second.seq);
+        expect((await service.ack('jr-access-gate', page.cursor)).cursor).toBe(second.seq);
+      });
+
+      test("(g) 'allowed': a 'denied' fill is skipped and a dead unfilled row neither delivers nor stalls", async () => {
+        const gated = await service.create({
+          name: 'jr-access-skip',
+          eventType: 'message.received',
+          access: 'allowed',
+          waitForReady: true,
+        });
+        const denied = await claim('g1', deniedInstanceId);
+        const dead = await claim('g2');
+        await backdate(dead.id);
+        const allowed = await claim('g3');
+        await fill(allowed.id, 'g3');
+
+        // The young unfilled row (verdict not landed yet) holds the page.
+        const held = await service.pull('jr-access-skip', { limit: 10 });
+        expect(held.items).toEqual([]);
+        expect((await service.getByName('jr-access-skip')).cursor).toBe(gated.cursor);
+
+        await fill(denied.id, 'g1', deniedInstanceId);
+        expect(await decisionOf(denied.id)).toBe('denied');
+        const page = await service.pull('jr-access-skip', { limit: 10 });
+        expect(page.items.map((e) => e.id)).toEqual([allowed.id]);
+        expect(page.cursor).toBe(allowed.seq);
+        expect(dead.seq).toBeLessThan(allowed.seq);
+
+        // A page holding only a dead unfilled row delivers nothing and advances the stored cursor (#1128).
+        const onlyDead = await service.create({
+          name: 'jr-access-dead',
+          eventType: 'message.received',
+          access: 'allowed',
+          waitForReady: true,
+        });
+        const lone = await claim('g4');
+        await backdate(lone.id);
+        const skipped = await service.pull('jr-access-dead', { limit: 10 });
+        expect(skipped.items).toEqual([]);
+        expect(skipped.cursor).toBe(lone.seq);
+        expect((await service.getByName('jr-access-dead')).cursor).toBe(lone.seq);
+        expect(onlyDead.cursor).toBeLessThan(lone.seq);
+      });
+
+      test("(h) shared + 'allowed' + waitForReady: no fresh lease spans an unfilled row; the filled page is leased", async () => {
+        const shared = await service.create({
+          name: 'jr-access-shared',
+          eventType: 'message.received',
+          access: 'allowed',
+          waitForReady: true,
+          shared: true,
+        });
+        const first = await claim('h1');
+        const second = await claim('h2');
+        await fill(second.id, 'h2');
+
+        const held = await service.pull('jr-access-shared', { limit: 10 });
+        expect(held.items).toEqual([]);
+        expect(held.leaseId).toBeUndefined();
+        expect((await service.getByName('jr-access-shared')).leaseState?.claimed).toBe(shared.cursor);
+
+        await fill(first.id, 'h1');
+        const page = await service.pull('jr-access-shared', { limit: 10 });
+        expect(page.items.map((e) => e.id)).toEqual([first.id, second.id]);
+        expect(page.cursor).toBe(second.seq);
+        if (!page.leaseId) throw new Error('leaseId missing');
+        expect((await service.ack('jr-access-shared', 0, page.leaseId)).cursor).toBe(second.seq);
+
+        // A fresh page of only a dead unfilled row is leased, matches nothing, and is released past it.
+        const lone = await claim('h3');
+        await backdate(lone.id);
+        const skipped = await service.pull('jr-access-shared', { limit: 10 });
+        expect(skipped.items).toEqual([]);
+        expect(skipped.leaseId).toBeUndefined();
+        expect((await service.getByName('jr-access-shared')).cursor).toBe(lone.seq);
+      });
     });
   });
 

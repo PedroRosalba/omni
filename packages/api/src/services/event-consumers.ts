@@ -45,6 +45,7 @@ import { ConflictError, ERROR_CODES, NotFoundError, OmniError, ValidationError, 
 import type { EventBus } from '@omni/core';
 import type {
   AutomationCondition,
+  ConsumerAccessFilter,
   ConsumerLease,
   Database,
   DurableConsumer,
@@ -71,6 +72,15 @@ export interface CreateConsumerInput {
   startFrom?: ConsumerStartFrom;
   /** Competing consumers: pullers on this name split the stream (#1188). Default false = fan-out. */
   shared?: boolean;
+  /**
+   * Opt-in access filter over the ingest verdict (`omni_events.access_decision`).
+   * 'all' (default) adds no predicate. 'allowed'/'denied' require
+   * OMNI_JOURNAL_ACCESS_DECISION=true, otherwise create() refuses with a 400.
+   * Without `waitForReady` a row whose fill lands late can be skipped (its
+   * verdict is still NULL when later rows move the cursor); set
+   * `waitForReady` to hold the page until the fill lands.
+   */
+  access?: ConsumerAccessFilter;
   /**
    * Opt-in journal readiness gate: hold claimed-but-unfilled rows (younger
    * than the settle window) instead of delivering them hollow. Default false.
@@ -363,6 +373,68 @@ function instanceScopeClause(consumer: Pick<DurableConsumer, 'scoped' | 'instanc
   return consumer.instanceIds?.length ? inArray(omniEvents.instanceId, consumer.instanceIds) : sql`false`;
 }
 
+/** Env flag that makes event persistence journal the access verdict (0081). */
+const ACCESS_DECISION_ENV = 'OMNI_JOURNAL_ACCESS_DECISION';
+
+/**
+ * The scanPage predicate for a consumer's access filter: undefined for 'all'
+ * (so the WHERE is exactly the unfiltered one), `access_decision = <filter>`
+ * otherwise. Rows journaled without a decision never match a filtered consumer.
+ *
+ * A claimed-but-unfilled row (`journal_ready` false) has no decision yet: the
+ * fill writes `access_decision` and `journal_ready = true` in one upsert.
+ * - Without `waitForReady` the plain predicate excludes that row while later
+ *   rows move the cursor past it, so a row whose fill lands late is skipped.
+ *   `waitForReady` is the fix for an access-filtered consumer.
+ * - With `waitForReady` the predicate widens to
+ *   `access_decision = <filter> OR journal_ready = false`: the not-ready row
+ *   reaches `truncateAtUnready`, which holds the page before it, and
+ *   `matchesConsumerAccess` then drops non-matching survivors in JS (a dead
+ *   not-ready row older than the settle window included) while the cursor
+ *   still advances past them.
+ */
+export function accessFilterClause(
+  filter: ConsumerAccessFilter | null | undefined,
+  waitForReady = false,
+): SQL | undefined {
+  if (filter !== 'allowed' && filter !== 'denied') return undefined;
+  const decided = eq(omniEvents.accessDecision, filter);
+  return waitForReady ? or(decided, eq(omniEvents.journalReady, false)) : decided;
+}
+
+/**
+ * The access filter applied to a scanned page, like the payload filter: true
+ * for 'all', otherwise the row's ingest verdict must equal the filter. Without
+ * `waitForReady` the SQL predicate already guarantees it; with it this drops
+ * the not-ready rows the widened predicate let through.
+ */
+export function matchesConsumerAccess(
+  row: Pick<OmniEvent, 'accessDecision'>,
+  filter: ConsumerAccessFilter | null | undefined,
+): boolean {
+  if (filter !== 'allowed' && filter !== 'denied') return true;
+  return row.accessDecision === filter;
+}
+
+/** True when a scanned row passes the consumer's access filter and payload conditions. */
+function matchesConsumer(row: OmniEvent, consumer: DurableConsumer): boolean {
+  return matchesConsumerAccess(row, consumer.accessFilter) && matchesConsumerPayload(row, consumer.filters);
+}
+
+/**
+ * Refuse an access-filtered consumer while nothing journals the verdict: it
+ * would match no row. Throws a ValidationError (HTTP 400) naming the env var.
+ */
+function assertAccessFilterAvailable(access: ConsumerAccessFilter | undefined): void {
+  if (access === undefined || access === 'all') return;
+  if (process.env[ACCESS_DECISION_ENV] === 'true') return;
+  throw new ValidationError(
+    `access '${access}' needs ${ACCESS_DECISION_ENV}=true: without it no journal row carries an access decision`,
+    undefined,
+    { access, env: ACCESS_DECISION_ENV },
+  );
+}
+
 /** Initial cursor for a new consumer. Exported for unit tests. */
 export function resolveInitialCursor(startFrom: ConsumerStartFrom, head: number): number {
   return startFrom === 'beginning' ? 0 : head;
@@ -433,6 +505,7 @@ export class EventConsumerService {
   }
 
   async create(input: CreateConsumerInput, caller?: ConsumerCaller): Promise<ConsumerWithLag> {
+    assertAccessFilterAvailable(input.access);
     const scope = resolveConsumerScope(input, caller);
     const head = await this.head();
     const cursor = resolveInitialCursor(input.startFrom ?? 'now', head);
@@ -449,6 +522,7 @@ export class EventConsumerService {
         waitForReady: input.waitForReady ?? false,
         leaseState: input.shared ? { claimed: cursor, leases: [] } : null,
         ...(scope.scoped ? scope : {}),
+        accessFilter: input.access ?? 'all',
       })
       .onConflictDoNothing({ target: durableConsumers.name })
       .returning();
@@ -522,7 +596,7 @@ export class EventConsumerService {
       scanned = await scan();
     }
 
-    const items = scanned.filter((row) => matchesConsumerPayload(row, consumer.filters));
+    const items = scanned.filter((row) => matchesConsumer(row, consumer));
     const last = scanned[scanned.length - 1];
     const cursor = last ? Number(last.journalSeq) : consumer.cursor;
     if (items.length === 0 && cursor > consumer.cursor) {
@@ -658,7 +732,7 @@ export class EventConsumerService {
     }
 
     const { consumer, lease, scanned } = claim;
-    const items = scanned.filter((row) => matchesConsumerPayload(row, consumer.filters));
+    const items = scanned.filter((row) => matchesConsumer(row, consumer));
     if (lease && items.length === 0) {
       // Nothing to deliver: release now so the cursor moves past filtered-out rows (#1128).
       await this.ackShared(consumer.name, lease.id).catch(() => undefined);
@@ -760,7 +834,12 @@ export class EventConsumerService {
    * EventService.list / #966 contract) minus the exclude globs (#1078).
    * A scoped consumer (0080) also keeps only its instances' rows — in the
    * same query, so the page's last row (the scanned cursor) is a row it may
-   * see, and the empty-page advance skips other instances' rows.
+   * see, and the empty-page advance skips other instances' rows. Only for an
+   * access-filtered consumer, the ingest access verdict (0081) is applied too.
+   * Every caller (fresh lease, reclaim, pull, withLag's caughtUp) inherits it.
+   * With `waitForReady` the access predicate also admits not-ready rows (see
+   * `accessFilterClause`), so a pending claim keeps caughtUp false and the
+   * callers apply `matchesConsumerAccess` to whatever survives truncation.
    */
   private async scanPage(
     consumer: DurableConsumer,
@@ -781,6 +860,7 @@ export class EventConsumerService {
           through === undefined ? undefined : lte(omniEvents.journalSeq, through),
           typeClause,
           instanceScopeClause(consumer),
+          accessFilterClause(consumer.accessFilter, consumer.waitForReady),
           extra,
         ),
       )
