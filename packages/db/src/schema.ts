@@ -3472,6 +3472,18 @@ export const durableConsumers = pgTable(
     waitForReady: boolean('wait_for_ready').notNull().default(false),
     /** Shared consumers only: claimed watermark + outstanding page leases. */
     leaseState: jsonb('lease_state').$type<SharedLeaseState>(),
+    /**
+     * Opt-in instance scoping (0082). false (default) = today's global
+     * consumer: every key with events:* may read and move it, and it pages
+     * every instance's rows. true = pull only pages rows whose instance_id is
+     * in `instance_ids`, and only the owner key (or an instance-unrestricted
+     * key) may see, pull, ack or delete it.
+     */
+    scoped: boolean('scoped').notNull().default(false),
+    /** Scoped consumers only: instance UUIDs this consumer may page. Null when unscoped. */
+    instanceIds: jsonb('instance_ids').$type<string[]>(),
+    /** Scoped consumers only: the api_keys.id that registered it. Null when unscoped. No FK (see 0082). */
+    ownerKeyId: uuid('owner_key_id'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
