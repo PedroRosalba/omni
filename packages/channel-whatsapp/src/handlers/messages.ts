@@ -760,22 +760,23 @@ export function extractInboundReplyTo(
 }
 
 /**
- * Describe the reacted-to message relative to THIS line. The reaction key's
- * fromMe is relative to the reactor, so it is recomputed: in groups from the
- * target participant, in DMs by comparing it with whether the reactor is us.
+ * Describe the reacted-to message relative to THIS line. Baileys' cleanMessage
+ * (normaliseKey) already rewrites a contact's reactionMessage.key to this
+ * line's perspective, and a reaction by this line is in it already, so in DMs
+ * key.fromMe is used as-is. In groups the target participant is resolved
+ * against this line's own ids (phone JID or LID).
  */
 function buildReactionTarget(
   plugin: Pick<WhatsAppPlugin, 'resolveSenderInstanceId'>,
   instanceId: string,
   key: WAMessageKey | null | undefined,
-  reactorIsThisLine: boolean,
 ): { fromMe: boolean; participant?: string } | undefined {
   if (!key) return undefined;
   const participant = key.participant || undefined;
   if (participant) {
     return { fromMe: plugin.resolveSenderInstanceId(instanceId, participant, false) === instanceId, participant };
   }
-  return { fromMe: reactorIsThisLine === (key.fromMe === true) };
+  return { fromMe: key.fromMe === true };
 }
 
 // Note: replaceMentionsWithNames removed - mention replacement now handled in
@@ -1030,7 +1031,6 @@ async function handleSpecialMessage(
         plugin,
         instanceId,
         msg.message ? unwrapEnvelopes(msg.message).reactionMessage?.key : undefined,
-        isFromMe(msg),
       ),
     );
     return true;
@@ -1452,7 +1452,7 @@ export function setupMessageHandlers(
         reaction.text || '',
         messageId,
         reaction.key?.fromMe || false,
-        buildReactionTarget(plugin, instanceId, key, reaction.key?.fromMe || false),
+        buildReactionTarget(plugin, instanceId, key),
       );
     }
   });

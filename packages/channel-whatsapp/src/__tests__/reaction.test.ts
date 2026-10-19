@@ -129,6 +129,24 @@ describe('inbound reaction target (additive)', () => {
     expect(targetOfCall()).toEqual({ fromMe: false });
   });
 
+  // Baileys' cleanMessage has already rewritten a contact's reaction key to this
+  // line's perspective (normaliseKey), so key.fromMe arrives relative to us.
+  it('DM: the contact reacting to this line message has target.fromMe true', async () => {
+    const { emitReaction, targetOfCall } = setup();
+    await emitReaction({ id: 'MSG-1', remoteJid: DM, fromMe: true }, { id: 'R-1', remoteJid: DM, fromMe: false }, '✅');
+    expect(targetOfCall()).toEqual({ fromMe: true });
+  });
+
+  it('DM: the contact reacting to its own message has target.fromMe false', async () => {
+    const { emitReaction, targetOfCall } = setup();
+    await emitReaction(
+      { id: 'MSG-1', remoteJid: DM, fromMe: false },
+      { id: 'R-1', remoteJid: DM, fromMe: false },
+      '⏳',
+    );
+    expect(targetOfCall()).toEqual({ fromMe: false });
+  });
+
   it('keeps every existing handleReactionReceived argument unchanged', async () => {
     const { emitReaction, handleReactionReceived } = setup();
     await emitReaction(
