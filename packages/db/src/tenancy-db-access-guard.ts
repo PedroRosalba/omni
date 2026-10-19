@@ -979,6 +979,17 @@ export const REGISTERED_DB_ACCESS: readonly RegisteredDbAccess[] = [
     class: 'tenant-boundary',
   },
   {
+    // Opt-in ingest access journal (0080, OMNI_JOURNAL_ACCESS_DECISION=true
+    // only): the instance access-mode lookup for an inbound message/reaction
+    // issues on `scopedHandle(db)` inside `runTenantWorkDb(db,
+    // trustedEnvelopeTenant(event), ...)` — the same worker tenant scope as the
+    // sibling entries, opened outside `runConsumerInTenantContext` on purpose so
+    // a failed evaluation cannot abort the fill. Consumer-only callers.
+    file: 'packages/api/src/plugins/event-persistence.ts',
+    table: 'instances',
+    class: 'tenant-boundary',
+  },
+  {
     // #1064: the agent-usage stamp (cost/tokens/model onto the triggering
     // event's journal row). Runs through `scopedHandle(db)` inside the
     // caller's worker tenant scope — `runDispatchDb` from the dispatcher,
