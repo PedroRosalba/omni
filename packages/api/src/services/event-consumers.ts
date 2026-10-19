@@ -55,7 +55,8 @@ import type {
 import { durableConsumers, instances, omniEvents } from '@omni/db';
 import { type SQL, and, asc, eq, gt, inArray, isNull, lte, or, sql } from 'drizzle-orm';
 import { z } from 'zod';
-import { scopedHandle } from '../tenancy/tenant-scope';
+import { runDetachedFromTenantScope, scopedHandle } from '../tenancy/tenant-scope';
+import { runTenantWorkDb } from '../tenancy/worker-tenant-context';
 import { eventTypeFilterClause } from './events';
 
 /** Where a new consumer's cursor starts: the journal head (default) or 0 (full replay). */
@@ -151,6 +152,46 @@ export interface PullResult {
   /** Shared consumers: ack with this id (not the cursor). Absent when nothing was delivered. */
   leaseId?: string;
 }
+
+/**
+ * One page of the SSE stream (`GET /events/consumers/:name/stream`). Same
+ * scan as pull, read-only: nothing here writes the cursor or a lease.
+ */
+export interface StreamScanResult {
+  /** Rows matching the type filter AND payload conditions, ascending journal_seq. */
+  items: OmniEvent[];
+  /** Highest journal_seq SCANNED (matched or not), or null when nothing was scanned. */
+  through: number | null;
+  /** The page was cut before a claimed-but-unfilled row younger than the settle window. */
+  held: boolean;
+  /** The page came back full and uncut: more rows are already waiting. */
+  full: boolean;
+}
+
+/** Who is reading a stream page: the request's trusted tenant and its API key as the consumer rules see it. */
+export interface StreamAccess {
+  /** Tenant the request scope resolved (null = legacy credential, ambient pool). */
+  tenantId: string | null;
+  /**
+   * The calling key (the pull route's `consumerCaller`): visibility and owner
+   * narrowing of scoped consumers, and its `instanceIds` (null = every
+   * instance, the `GET /events` rule) restrict every page.
+   */
+  caller: ConsumerCaller;
+}
+
+/**
+ * The instance restriction for a stream page: none for a full-access key,
+ * otherwise `instance_id IN (...)` (rows with no instance excluded, as in
+ * `GET /events`), and a match-nothing predicate for an empty allow-list.
+ */
+export function streamInstanceClause(instanceIds: readonly string[] | null): SQL | undefined {
+  if (instanceIds === null) return undefined;
+  return instanceIds.length === 0 ? sql`false` : inArray(omniEvents.instanceId, [...instanceIds]);
+}
+
+/** Rows the stream scans per page (matches are <= this). */
+const STREAM_PAGE_LIMIT = 100;
 
 const PULL_POLL_INTERVAL_MS = 500;
 const PULL_MAX_LIMIT = 500;
@@ -648,6 +689,73 @@ export class EventConsumerService {
     return this.withLag(updated, await this.head());
   }
 
+  /**
+   * The consumer behind an SSE stream. Fan-out consumers only: a shared
+   * consumer is refused (400), because handing out leases is the pull path's
+   * job and the stream never takes or acks one.
+   */
+  async getStreamable(name: string, caller?: ConsumerCaller): Promise<DurableConsumer> {
+    // Exactly as pull: a scoped consumer the caller may not see is a 404, and
+    // a restricted owner pages only the stored instances its key still has.
+    const consumer = narrowToCaller(await this.getVisible(name, caller), caller);
+    if (consumer.shared) {
+      throw new ValidationError(
+        `consumer '${name}' is shared — streams serve fan-out consumers only; pull and ack with the leaseId`,
+        undefined,
+        { name },
+      );
+    }
+    return consumer;
+  }
+
+  /**
+   * One SSE stream page strictly after `after`: the pull scan (type filter,
+   * exclude globs, payload conditions) with the readiness gate ALWAYS on,
+   * whatever the consumer's own waitForReady says, so a hollow row is held
+   * rather than pushed. Read-only: never writes the cursor or a lease.
+   *
+   * A stream outlives the request that opened it, and with a tenant
+   * credential that request's transaction has committed by the time a later
+   * page is read. So every page runs detached from the request scope, in a
+   * short worker transaction of its own for `trustedTenantId` (the tenant the
+   * request scope resolved), or on the ambient pool for a legacy credential.
+   * The consumer is re-read per page, so a deleted consumer ends the stream.
+   *
+   * The scan runs as `{ ...consumer, waitForReady: true }`: with an access
+   * filter (0083) that widens the predicate to admit unfilled rows, so they
+   * are held rather than skipped, and the survivors are filtered with the
+   * pull's own `matchesConsumer` (payload + access verdict), so a dead
+   * unfilled row past the settle window is skipped, not streamed.
+   *
+   * Scoping matches pull (getVisible + narrowToCaller), and an
+   * instance-restricted API key additionally only scans its own instances'
+   * rows (the `GET /events` rule), so other instances' rows are never sent
+   * and never hold the page; the position simply moves on past them.
+   */
+  async scanForStream(
+    name: string,
+    after: number,
+    access: StreamAccess,
+    limit: number = STREAM_PAGE_LIMIT,
+  ): Promise<StreamScanResult> {
+    return runDetachedFromTenantScope(() =>
+      runTenantWorkDb(this.pool, access.tenantId, async () => {
+        const consumer = { ...(await this.getStreamable(name, access.caller)), waitForReady: true };
+        const keyInstances = streamInstanceClause(access.caller.instanceIds);
+        const page = await this.scanPage(consumer, limit, after, undefined, keyInstances);
+        const rows = truncateAtUnready(page, true, resolveConsumerSettleMs(), Date.now());
+        const held = rows.length < page.length;
+        const last = rows[rows.length - 1];
+        return {
+          items: rows.filter((row) => matchesConsumer(row, consumer)),
+          through: last ? Number(last.journalSeq) : null,
+          held,
+          full: !held && page.length === limit,
+        };
+      }),
+    );
+  }
+
   /** Shared pull: lease the next page (or an expired one) to this caller alone. */
   private async pullShared(
     initial: DurableConsumer,
@@ -778,6 +886,8 @@ export class EventConsumerService {
     limit: number,
     after = consumer.cursor,
     through?: number,
+    /** Extra predicate (the stream's instance restriction); pull never passes one. */
+    extra?: SQL,
   ): Promise<OmniEvent[]> {
     const typeClause = eventTypeFilterClause([consumer.eventType], consumer.excludeTypes ?? undefined);
 
@@ -791,6 +901,7 @@ export class EventConsumerService {
           typeClause,
           instanceScopeClause(consumer),
           accessFilterClause(consumer.accessFilter, consumer.waitForReady),
+          extra,
         ),
       )
       .orderBy(asc(omniEvents.journalSeq))

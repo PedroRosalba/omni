@@ -194,6 +194,25 @@ export const AckConsumerSchema = z
     message: 'cursor or leaseId is required',
   });
 
+/** A journal_seq position on the wire: digits only, a non-negative safe integer. */
+const JournalSeqStringSchema = z
+  .string()
+  .trim()
+  .regex(/^\d{1,15}$/, 'must be a non-negative integer journal_seq');
+
+export const StreamConsumerQuerySchema = z.object({
+  after: JournalSeqStringSchema.optional().openapi({
+    description:
+      'Start strictly after this journal_seq (default: the stored cursor). Ignored when Last-Event-ID is sent',
+  }),
+});
+
+export const StreamConsumerHeaderSchema = z.object({
+  'last-event-id': JournalSeqStringSchema.optional().openapi({
+    description: 'EventSource reconnect position (the last received event id); wins over ?after',
+  }),
+});
+
 const PullResultSchema = z.object({
   consumer: z.string().openapi({ description: 'Consumer name' }),
   items: z
@@ -324,6 +343,52 @@ export function registerEventConsumerSchemas(registry: OpenAPIRegistry): void {
       200: { description: 'One page of events', content: { 'application/json': { schema: PullResultSchema } } },
       404: {
         description: 'No such consumer (or a scoped consumer this key cannot access)',
+        content: { 'application/json': { schema: ErrorSchema } },
+      },
+    },
+  });
+
+  registry.registerPath({
+    method: 'get',
+    path: '/events/consumers/{name}/stream',
+    operationId: 'streamEventConsumer',
+    tags: ['Events'],
+    summary: 'Stream journal events for a consumer (SSE)',
+    description:
+      'Opt-in Server-Sent Events push over the same journal scan as pull (type glob, excludeTypes, payload ' +
+      'conditions, journal_seq order), always behind the journal readiness gate: a claimed-but-unfilled row is ' +
+      'held until it is filled or older than EVENT_CONSUMER_SETTLE_MS. Starts strictly after Last-Event-ID, else ' +
+      '?after, else the stored cursor; catches up, then follows live. Each matching row is one event ' +
+      '(`id: <journal_seq>`, `event: <eventType>`, `data: <the row as pull returns it>`), after an initial ' +
+      '`connected` event; a `: heartbeat` comment is sent every EVENT_STREAM_HEARTBEAT_MS (default 15000). ' +
+      'READ-ONLY: the stream never moves the stored cursor and never takes a lease — keep acking with ' +
+      'POST /events/consumers/{name}/ack. Fan-out consumers only: a shared consumer is refused with 400. A ' +
+      'consumer deleted mid-stream ends the stream with an `error` event. Requires events:write (as pull) and ' +
+      'resolves the consumer exactly as pull: a scoped consumer the key may not see is 404, a restricted owner ' +
+      'streams only its narrowed instances, and an instance-restricted API key only receives rows of its own ' +
+      'instances. An access-filtered consumer holds an unfilled row until its verdict lands. A stream lives at most ' +
+      'EVENT_STREAM_MAX_LIFETIME_MS (default and maximum 30000, the revocation ceiling), then ends with a ' +
+      '`reconnect` event carrying `retry:` and `id:` (the scanned position, past filtered-out rows) — reconnect ' +
+      'with Last-Event-ID to resume and re-authenticate. Past ' +
+      'EVENT_STREAM_MAX_PER_PROCESS open streams, or EVENT_STREAM_MAX_PER_KEY for the calling key, a new one is ' +
+      'refused with 429.',
+    request: {
+      params: z.object({ name: z.string().openapi({ description: 'Consumer name' }) }),
+      query: StreamConsumerQuerySchema,
+      headers: StreamConsumerHeaderSchema,
+    },
+    responses: {
+      200: {
+        description: 'SSE stream of matching journal rows',
+        content: { 'text/event-stream': { schema: z.string() } },
+      },
+      400: {
+        description: 'Invalid start position, or the consumer is shared',
+        content: { 'application/json': { schema: ErrorSchema } },
+      },
+      404: { description: 'No such consumer', content: { 'application/json': { schema: ErrorSchema } } },
+      429: {
+        description: 'Too many open streams on this server or for this key (EVENT_STREAM_MAX_PER_PROCESS / _PER_KEY)',
         content: { 'application/json': { schema: ErrorSchema } },
       },
     },
