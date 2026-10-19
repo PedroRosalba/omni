@@ -1,6 +1,7 @@
 import { describe, expect, mock, test } from 'bun:test';
 import { NotFoundError } from '@omni/core';
 import { Hono } from 'hono';
+import { errorHandler } from '../../../middleware/error';
 import type { AppVariables } from '../../../types';
 import { messagesRoutes } from '../messages';
 
@@ -18,6 +19,8 @@ type MountOptions = {
   getByIdThrows?: boolean;
   getByIdError?: Error;
   storedParticipant?: string;
+  channel?: string;
+  withErrorHandler?: boolean;
 };
 
 function mountMessagesRoutes(options: MountOptions = {}): Hono<{ Variables: AppVariables }> {
@@ -30,10 +33,11 @@ function mountMessagesRoutes(options: MountOptions = {}): Hono<{ Variables: AppV
     }));
 
   const app = new Hono<{ Variables: AppVariables }>();
+  if (options.withErrorHandler) app.onError(errorHandler);
   app.use('*', async (c, next) => {
     c.set('services', {
       instances: {
-        getById: mock(async (id: string) => ({ id, channel: 'whatsapp-baileys' })),
+        getById: mock(async (id: string) => ({ id, channel: options.channel ?? 'whatsapp-baileys' })),
       },
       persons: {
         getIdentityForChannel: mock(async () => null),
@@ -242,24 +246,68 @@ describe('POST /messages/send/reaction additive inputs (remove, targetKey)', () 
     });
   });
 
-  test("emoji '' is accepted and sends a removal", async () => {
+  test("emoji '' is rejected with 400 as before, and nothing is sent", async () => {
     const sendMessage = okReactionSend();
     const res = await postReactionBody(mountMessagesRoutes({ sendMessage }), { emoji: '' });
 
+    expect(res.status).toBe(400);
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  test('emoji is required when remove is not true', async () => {
+    const sendMessage = okReactionSend();
+    const res = await postReactionBody(mountMessagesRoutes({ sendMessage }), {});
+
+    expect(res.status).toBe(400);
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  test('remove: true without emoji sends a removal on WhatsApp', async () => {
+    const sendMessage = okReactionSend();
+    const res = await postReactionBody(mountMessagesRoutes({ sendMessage }), { remove: true });
+
     expect(res.status).toBe(200);
-    expect(sendMessage.mock.calls[0]?.[1]).toMatchObject({
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage.mock.calls[0]?.[1]).toEqual({
+      to: CHAT_EXTERNAL_ID,
       content: { type: 'reaction', emoji: '', targetMessageId: MESSAGE_EXTERNAL_ID },
       metadata: { fromMe: false },
     });
   });
 
-  test('remove: true sends a removal whatever emoji is given', async () => {
-    const sendMessage = okReactionSend();
-    const res = await postReactionBody(mountMessagesRoutes({ sendMessage }), { emoji: '👍', remove: true });
+  for (const emoji of ['👍', '', 42]) {
+    test(`remove: true sends a removal whatever emoji is given (${JSON.stringify(emoji)})`, async () => {
+      const sendMessage = okReactionSend();
+      const res = await postReactionBody(mountMessagesRoutes({ sendMessage }), { emoji, remove: true });
 
-    expect(res.status).toBe(200);
-    expect((sendMessage.mock.calls[0]?.[1] as { content: { emoji: string } }).content.emoji).toBe('');
-  });
+      expect(res.status).toBe(200);
+      expect((sendMessage.mock.calls[0]?.[1] as { content: { emoji: string } }).content.emoji).toBe('');
+    });
+  }
+
+  for (const channel of ['discord', 'slack', 'telegram']) {
+    test(`remove: true on ${channel} (no removal support) is refused and nothing is sent`, async () => {
+      const sendMessage = okReactionSend();
+      const app = mountMessagesRoutes({ sendMessage, channel, withErrorHandler: true });
+
+      const res = await postReactionBody(app, { emoji: '👍', remove: true });
+      const body = (await res.json()) as { error: { code: string; message: string } };
+
+      expect(body.error.code).toBe('CAPABILITY_NOT_SUPPORTED');
+      expect(body.error.message).toBe(`Channel ${channel} does not support removing reactions`);
+      expect(sendMessage).not.toHaveBeenCalled();
+    });
+  }
+
+  for (const channel of ['whatsapp-business', 'hermes']) {
+    test(`remove: true on ${channel} sends a removal`, async () => {
+      const sendMessage = okReactionSend();
+      const res = await postReactionBody(mountMessagesRoutes({ sendMessage, channel }), { remove: true });
+
+      expect(res.status).toBe(200);
+      expect((sendMessage.mock.calls[0]?.[1] as { content: { emoji: string } }).content.emoji).toBe('');
+    });
+  }
 
   test('remove: false leaves a non-empty emoji untouched', async () => {
     const sendMessage = okReactionSend();
@@ -268,12 +316,20 @@ describe('POST /messages/send/reaction additive inputs (remove, targetKey)', () 
     expect((sendMessage.mock.calls[0]?.[1] as { content: { emoji: string } }).content.emoji).toBe('👍');
   });
 
-  test('emoji is still required', async () => {
+  test("remove: false with emoji '' is still a 400", async () => {
     const sendMessage = okReactionSend();
-    const res = await postReactionBody(mountMessagesRoutes({ sendMessage }), { remove: true });
+    const res = await postReactionBody(mountMessagesRoutes({ sendMessage }), { emoji: '', remove: false });
 
     expect(res.status).toBe(400);
     expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  test('a non-removal reaction on a channel without removal support is unaffected', async () => {
+    const sendMessage = okReactionSend();
+    const res = await postReactionBody(mountMessagesRoutes({ sendMessage, channel: 'discord' }), { emoji: '👍' });
+
+    expect(res.status).toBe(200);
+    expect((sendMessage.mock.calls[0]?.[1] as { content: { emoji: string } }).content.emoji).toBe('👍');
   });
 
   for (const emoji of ['⏳', '✅', '❌', '✋']) {

@@ -752,12 +752,15 @@ function buildSendMediaMetadata(data: z.infer<typeof sendMediaSchema>): Record<s
 }
 
 // Send reaction schema
-const sendReactionSchema = z.object({
+const sendReactionObjectSchema = z.object({
   instanceId: z.string().uuid().describe('Instance ID'),
   to: z.string().min(1).describe('Chat ID'),
   messageId: z.string().min(1).describe('Message ID to react to'),
-  emoji: z.string().describe('Emoji to react with (empty string removes the reaction)'),
-  remove: z.boolean().optional().describe('Remove the reaction (sends an empty emoji whatever emoji is given)'),
+  emoji: z.string().min(1).describe('Emoji to react with'),
+  remove: z
+    .boolean()
+    .optional()
+    .describe('Remove this instance reaction from the message; emoji may then be omitted and is ignored'),
   targetKey: z
     .object({
       fromMe: z.boolean().describe('Whether the target message was sent by this instance'),
@@ -766,6 +769,33 @@ const sendReactionSchema = z.object({
     .optional()
     .describe('Overrides the target key fromMe/participant otherwise read from the stored message'),
 });
+
+/** Stands in for `emoji` on a `remove: true` request; the route never sends it. */
+const REACTION_REMOVAL_PLACEHOLDER = 'remove';
+
+/**
+ * `remove: true` is the only way to remove a reaction: it fills `emoji` with a
+ * placeholder before validation, so the emoji may be omitted or hold anything.
+ * Every other body is validated exactly as before (`emoji: ''` stays a 400).
+ */
+const sendReactionSchema = z.preprocess(
+  (input) =>
+    typeof input === 'object' && input !== null && (input as { remove?: unknown }).remove === true
+      ? { ...input, emoji: REACTION_REMOVAL_PLACEHOLDER }
+      : input,
+  sendReactionObjectSchema,
+);
+
+/**
+ * Channels whose outbound reaction sender treats an empty emoji as removal:
+ * Baileys (channel-whatsapp/src/senders/reaction.ts), Meta Cloud
+ * (channel-whatsapp-business/src/senders/reaction.ts) and Hermes
+ * (channel-hermes/src/senders/reaction.ts). Discord and Slack reject an empty
+ * emoji and Telegram silently ignores it, so `remove: true` is refused there.
+ * A route-local list rather than a capability flag: plugin capabilities are
+ * serialized as-is by GET /instances/supported-channels.
+ */
+const REACTION_REMOVAL_CHANNELS: ReadonlySet<string> = new Set(['whatsapp-baileys', 'whatsapp-business', 'hermes']);
 
 /**
  * Caller-supplied target key replaces whatever resolveReactionTarget derived
@@ -1547,6 +1577,15 @@ messagesRoutes.post('/send/reaction', zValidator('json', sendReactionSchema), as
     });
   }
 
+  if (remove === true && !REACTION_REMOVAL_CHANNELS.has(instance.channel)) {
+    throw new OmniError({
+      code: ERROR_CODES.CAPABILITY_NOT_SUPPORTED,
+      message: `Channel ${instance.channel} does not support removing reactions`,
+      context: { channelType: instance.channel },
+      recoverable: false,
+    });
+  }
+
   // Resolve recipient (handles person ID to platform ID resolution)
   // Note: For reactions, 'to' is typically a chat ID, but we support person ID resolution too
   const resolvedTo = await resolveRecipient(to, instance.channel, services);
@@ -1564,7 +1603,7 @@ messagesRoutes.post('/send/reaction', zValidator('json', sendReactionSchema), as
 
   // Build outgoing message for reaction. When the target is unknown, omit
   // metadata so the plugin applies its own fallback (defaults to true for Baileys).
-  // `remove: true` (or emoji '') sends an empty emoji, which the plugin treats as removal.
+  // `remove: true` sends an empty emoji, which these channels' senders treat as removal.
   const outgoingMessage: OutgoingMessage = {
     to: resolvedTo,
     content: {
